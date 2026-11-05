@@ -82,7 +82,7 @@ def test_uid_tty():
             logger.info("uid_tty test failed after 500 attempts")
             logger.info("container ID: %s", cid)
             if last_error:
-                logger.info("last error: %s", e)
+                logger.info("last error: %s", last_error)
         return ret
     finally:
         if cid is not None:
@@ -255,11 +255,6 @@ def test_exec_add_capability():
     add_all_namespaces(conf)
     conf['process']['capabilities'] = {}
     cid = None
-    cap_unknown_dict = {"CapInh":"0000000000000000", \
-                        "CapPrm":"0000000000000000", \
-                        "CapEff":"0000000000000000", \
-                        "CapBnd":"0000000000000000", \
-                        "CapAmb":"0000000000000000"}
     cap_kill_dict = {"CapInh":"0000000000000000", \
                      "CapPrm":"0000000000000020", \
                      "CapEff":"0000000000000020", \
@@ -270,8 +265,7 @@ def test_exec_add_capability():
                           "CapEff":"0000000000200000", \
                           "CapBnd":"0000000000200000", \
                           "CapAmb":"0000000000000000"}
-    cap_dict = {"CAP_UNKNOWN": cap_unknown_dict, \
-                "CAP_KILL": cap_kill_dict, \
+    cap_dict = {"CAP_KILL": cap_kill_dict, \
                 "CAP_SYS_ADMIN": cap_sys_admin_dict}
     try:
         _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
@@ -284,6 +278,13 @@ def test_exec_add_capability():
             for i in ['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb']:
                 if proc_status[i] != value[i]:
                     return -1
+
+        try:
+            run_crun_command(["exec", "--cap", "CAP_UNKNOWN", cid, "/init", "cat", "/proc/self/status"])
+            logger.info("CAP_UNKNOWN should be rejected")
+            return -1
+        except subprocess.CalledProcessError:
+            pass
     finally:
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
@@ -297,7 +298,7 @@ def test_exec_add_env():
     conf['process']['capabilities'] = {}
     cid = None
     env_args_list = []
-    env_dict_orig = {"HOME":"/", "PATH":"/bin"}
+    env_dict_orig = {"HOME":"/", "PATH":"/bin", "TERM":"xterm"}
     env_dict_new = {"HOME":"/tmp", "PATH":"/usr/bin","FOO":"BAR"}
     try:
         _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
@@ -320,6 +321,12 @@ def test_exec_add_env():
                                 "-e", env_args_list[2], \
                                 cid, "/init", "printenv", "PATH"])
         if env_dict_new["PATH"] not in out:
+            return -1
+
+        # --env must merge with, not replace, the container's default env:
+        # PATH from the spec must still be set when only an unrelated var is added.
+        out = run_crun_command(["exec", "--env", "FOO=BAR", cid, "/init", "printenv", "PATH"])
+        if env_dict_orig["PATH"] not in out:
             return -1
     finally:
         if cid is not None:
@@ -498,6 +505,36 @@ def test_exec_getpgrp():
             run_crun_command(["delete", "-f", cid])
     return 0
 
+def test_exec_session_keyring():
+    """Test that the exec'd process does not inherit the caller's session keyring"""
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'pause']
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+        ids = []
+        for _ in range(2):
+            try:
+                out = run_crun_command_raw(["exec", cid, "/init", "session-keyring"]).decode(errors='ignore')
+            except subprocess.CalledProcessError as e:
+                out = e.output.decode(errors='ignore') if e.output else ""
+                if "Function not implemented" in out:
+                    return (77, "keyctl not supported")
+                logger.info("exec failed: %s", out)
+                return -1
+            if "keyctl_join is not supported" in out:
+                return (77, "keyctl not supported")
+            ids.append(out.strip().splitlines()[-1])
+        # each exec must get its own session keyring, not the one of the caller.
+        if ids[0] == ids[1]:
+            logger.info("the session keyring %s was inherited from the caller", ids[0])
+            return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
 def test_exec_help():
     out = run_crun_command(["exec", "--help"])
     if "Usage: crun [OPTION...] exec CONTAINER cmd" not in out:
@@ -523,7 +560,7 @@ def test_exec_error_propagation():
 
             if has_chdir_error and has_read_pipe_error:
                 logger.info("exec error propagation test failed: both chdir and read pipe errors detected")
-                logger.info("error message: %s", error_output)
+                logger.info("error message: %s", error_msg)
                 return -1
 
             if not has_chdir_error:
@@ -671,6 +708,18 @@ def test_exec_exit_code():
                 logger.info("test_exec_exit_code: expected exit code 42, got %d", e.returncode)
                 return -1
 
+        # Failures of exec itself use 255, to be told apart from the
+        # exit code of the executed process.
+        for args in [[cid, "/not.here"], ["no-such-container", "/init", "true"]]:
+            try:
+                run_crun_command_raw(["exec"] + args)
+                logger.info("test_exec_exit_code: expected exec %s to fail", args)
+                return -1
+            except subprocess.CalledProcessError as e:
+                if e.returncode != 255:
+                    logger.info("test_exec_exit_code: exec %s: expected exit code 255, got %d", args, e.returncode)
+                    return -1
+
         return 0
 
     except Exception as e:
@@ -680,6 +729,99 @@ def test_exec_exit_code():
         if cid is not None:
             run_crun_command(["delete", "-f", cid])
 
+
+def test_exec_dev_null_reopened():
+    """Test that exec does not pass down the /dev/null of the host."""
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    # use a different mode to tell the container /dev/null apart from the host one
+    conf['linux']['devices'] = [{"path": "/dev/null", "type": "c", "major": 1, "minor": 3, "fileMode": 0o640}]
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+
+        args = [get_crun_path(), "--root", get_tests_root_status(), "exec", cid, "/init", "mode", "/proc/self/fd/0"]
+        out = subprocess.check_output(args, stdin=subprocess.DEVNULL, close_fds=False).decode()
+        if out != "640":
+            logger.info("test_exec_dev_null_reopened: expected mode '640', got '%s'", out)
+            return -1
+
+        return 0
+
+    except Exception as e:
+        logger.info("test_exec_dev_null_reopened failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+
+
+def test_exec_oom_score_adj():
+    with open("/proc/self/oom_score_adj") as f:
+        current = int(f.read())
+    if current > 800:
+        return 77
+    container_value = current + 100
+    process_value = current + 200
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    conf['process']['oomScoreAdj'] = container_value
+    add_all_namespaces(conf)
+    cid = None
+    tempdir = tempfile.mkdtemp()
+
+    def exec_and_get_oom_score_adj(cid, oom_score_adj=None):
+        process_file = os.path.join(tempdir, "process.json")
+        with open(process_file, "w") as f:
+            process = {
+                "user": {
+                    "uid": 0,
+                    "gid": 0
+                },
+                "terminal": False,
+                "cwd" : "/",
+                "args": [
+                    "/init",
+                    "cat",
+                    "/proc/self/oom_score_adj"
+                ]
+            }
+            if oom_score_adj is not None:
+                process["oomScoreAdj"] = oom_score_adj
+            json.dump(process, f)
+
+        return run_crun_command(["exec", "--process", process_file, cid]).strip()
+
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+
+        out = run_crun_command(["exec", cid, "/init", "cat", "/proc/self/oom_score_adj"]).strip()
+        if out != str(container_value):
+            logger.info("oom_score_adj without process file %s != %d", out, container_value)
+            return -1
+
+        out = exec_and_get_oom_score_adj(cid)
+        if out != str(container_value):
+            logger.info("oom_score_adj from container config %s != %d", out, container_value)
+            return -1
+
+        out = exec_and_get_oom_score_adj(cid, process_value)
+        if out != str(process_value):
+            logger.info("oom_score_adj from process file %s != %d", out, process_value)
+            return -1
+        return 0
+    except Exception as e:
+        logger.info("test_exec_oom_score_adj failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+        shutil.rmtree(tempdir)
 
 all_tests = {
     "exec" : test_exec,
@@ -696,6 +838,7 @@ all_tests = {
     "exec-test-uid-tty": test_uid_tty,
     "exec-cpu-affinity": test_exec_cpu_affinity,
     "exec-getpgrp": test_exec_getpgrp,
+    "exec-session-keyring": test_exec_session_keyring,
     "exec-help" : test_exec_help,
     "exec-error-propagation" : test_exec_error_propagation,
     "exec-cwd" : test_exec_cwd,
@@ -703,6 +846,8 @@ all_tests = {
     "exec-detach" : test_exec_detach,
     "exec-multiple" : test_exec_multiple,
     "exec-exit-code" : test_exec_exit_code,
+    "exec-dev-null-reopened" : test_exec_dev_null_reopened,
+    "exec-oom-score-adj" : test_exec_oom_score_adj,
 }
 
 if __name__ == "__main__":

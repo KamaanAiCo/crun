@@ -16,6 +16,7 @@
 # along with crun.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import shutil
 from tests_utils import *
 
 def test_fail_prestart():
@@ -264,12 +265,158 @@ def test_createRuntime_hook_bundle_path():
             os.unlink(state_file)
 
 
+def test_hooks_bundle_path_not_cwd():
+    """All hooks must report the bundle path, not crun's current directory.
+
+    crun is started from / with the bundle passed as a symlink to it, so that
+    getcwd() differs from the bundle path given on the command line.  The hooks
+    (and the container status they are fed from) must report the latter.
+    """
+    import tempfile
+    import json
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+
+    hook_names = ["prestart", "createRuntime", "poststart", "poststop"]
+
+    state_dir = tempfile.mkdtemp()
+    try:
+        conf['hooks'] = {}
+        for name in hook_names:
+            conf['hooks'][name] = [{
+                "path": "/bin/sh",
+                "args": ["/bin/sh", "-c", "cat > " + os.path.join(state_dir, name)]
+            }]
+
+        run_and_get_output(conf, hide_stderr=True, bundle_via_symlink=True)
+
+        for name in hook_names:
+            state_file = os.path.join(state_dir, name)
+            if not os.path.exists(state_file) or os.path.getsize(state_file) == 0:
+                logger.info("%s hook did not receive any state", name)
+                return -1
+
+            with open(state_file) as f:
+                bundle_path = json.load(f)['bundle']
+
+            if not os.path.exists(os.path.join(bundle_path, "config.json")):
+                logger.info("%s hook bundle has no config.json: '%s'", name, bundle_path)
+                return -1
+
+            # The bundle was passed as a symlink, so the reported path must
+            # still be that symlink.  A resolved path means crun reported its
+            # own working directory instead.
+            if not os.path.islink(bundle_path):
+                logger.info("%s hook got crun cwd instead of the bundle: '%s'", name, bundle_path)
+                return -1
+
+        return 0
+
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def _get_in_container_hook_state(name, hook):
+    """Run a container with an in-container hook, return the state it got."""
+    import tempfile
+    import json
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+    conf['hooks'] = {name: [hook]}
+
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
+        state_file = f.name
+    try:
+        conf['annotations'] = {'run.oci.hooks.stdout': state_file}
+        run_and_get_output(conf, hide_stderr=True, bundle_via_symlink=True)
+        with open(state_file) as f:
+            return json.load(f)
+    finally:
+        os.unlink(state_file)
+
+
+def test_in_container_hooks_state():
+    """createContainer and startContainer hooks must get the correct state (issue #2285).
+
+    The pid must be the container process pid, as seen from the container,
+    the bundle must be the bundle path as seen by the runtime, and the
+    status must be "created".
+    """
+    hooks = {
+        # createContainer runs before pivot_root, so a host binary is used.
+        "createContainer": {"path": "/bin/cat"},
+        "startContainer": {"path": "/init", "args": ["/init", "cat", "/proc/self/fd/0"]},
+    }
+
+    for name, hook in hooks.items():
+        try:
+            state = _get_in_container_hook_state(name, hook)
+        except Exception as e:
+            logger.info("%s: failed to get hook state: %s", name, e)
+            return -1
+
+        pid = state.get('pid')
+        if not isinstance(pid, int) or pid <= 0:
+            logger.info("%s hook got invalid pid: %s", name, state)
+            return -1
+
+        # The bundle is passed to crun as a symlink, see
+        # test_hooks_bundle_path_not_cwd.
+        bundle = state.get('bundle', '')
+        if not os.path.islink(bundle) or not os.path.exists(os.path.join(bundle, "config.json")):
+            logger.info("%s hook got invalid bundle: %s", name, state)
+            return -1
+
+        if state.get('status') != 'created':
+            logger.info("%s hook got invalid status: %s", name, state)
+            return -1
+
+    return 0
+
+
 def test_createContainer_hook():
     """Test createContainer hook."""
     conf = base_config()
     add_all_namespaces(conf)
 
     hook = {"path": "/bin/true"}
+    conf['hooks'] = {"createContainer": [hook]}
+
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=True)
+        return 0
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+
+
+def test_createContainer_hook_after_mounts():
+    """Test createContainer hook runs after mounts are set up (issue #2167).
+
+    Per the OCI runtime spec the createContainer hooks must be called after
+    the mount namespace has been set up but before pivot_root.  The hook runs
+    with the bundle as its working directory, so the container /proc mount is
+    visible at rootfs/proc.  rootfs/proc/self only exists once proc has been
+    mounted, so this fails if the hook runs before libcrun_set_mounts.
+    """
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+
+    hook = {
+        "path": "/bin/sh",
+        "args": ["/bin/sh", "-c", "test -e rootfs/proc/self"]
+    }
     conf['hooks'] = {"createContainer": [hook]}
 
     try:
@@ -560,6 +707,64 @@ def test_poststart_fail_deletes_container():
                 pass
 
 
+def _test_poststop_hook_on_create_failure(failing_hook, command):
+    """Check that a failing createRuntime hook still triggers the poststop hooks."""
+    import tempfile
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+        marker_file = f.name
+    os.unlink(marker_file)
+
+    conf['hooks'] = {
+        "createRuntime": [failing_hook],
+        "poststop": [{"path": "/bin/touch", "args": ["/bin/touch", marker_file]}],
+    }
+
+    cid = None
+    try:
+        try:
+            if command == 'create':
+                proc, cid = run_and_get_output(conf, command='create', use_popen=True, hide_stderr=True)
+                if proc.wait() == 0:
+                    logger.error("create succeeded but the createRuntime hook should have failed")
+                    return -1
+            else:
+                run_and_get_output(conf, hide_stderr=True)
+                logger.error("run succeeded but the createRuntime hook should have failed")
+                return -1
+        except Exception:
+            pass
+
+        if not os.path.exists(marker_file):
+            logger.error("poststop hook was not executed after the createRuntime hook failed")
+            return -1
+
+        return 0
+    finally:
+        if cid is not None:
+            try:
+                run_crun_command(["delete", "-f", cid])
+            except Exception:
+                pass
+        if os.path.exists(marker_file):
+            os.unlink(marker_file)
+
+
+def test_poststop_hook_on_createruntime_failure():
+    """Test that poststop hooks run when a createRuntime hook exits with an error."""
+    return _test_poststop_hook_on_create_failure({"path": "/bin/false"}, 'run')
+
+
+def test_poststop_hook_on_createruntime_timeout():
+    """Test that poststop hooks run when a createRuntime hook hits its timeout."""
+    hook = {"path": "/bin/sleep", "args": ["/bin/sleep", "10"], "timeout": 1}
+    return _test_poststop_hook_on_create_failure(hook, 'create')
+
+
 all_tests = {
     "test-fail-prestart" : test_fail_prestart,
     "test-success-prestart" : test_success_prestart,
@@ -571,7 +776,10 @@ all_tests = {
     "test-poststop-hook": test_poststop_hook,
     "test-createRuntime-hook": test_createRuntime_hook,
     "test-createRuntime-hook-bundle-path": test_createRuntime_hook_bundle_path,
+    "test-hooks-bundle-path-not-cwd": test_hooks_bundle_path_not_cwd,
+    "test-in-container-hooks-state": test_in_container_hooks_state,
     "test-createContainer-hook": test_createContainer_hook,
+    "test-createContainer-hook-after-mounts": test_createContainer_hook_after_mounts,
     "test-startContainer-hook": test_startContainer_hook,
     "test-hook-with-timeout": test_hook_with_timeout,
     "test-hook-receives-state": test_hook_receives_state,
@@ -580,6 +788,8 @@ all_tests = {
     "test-poststop-hook-failure-warning": test_poststop_hook_failure_warning,
     "test-multiple-poststop-hooks-failure": test_multiple_poststop_hooks_failure,
     "test-poststart-fail-deletes-container": test_poststart_fail_deletes_container,
+    "test-poststop-hook-on-createruntime-failure": test_poststop_hook_on_createruntime_failure,
+    "test-poststop-hook-on-createruntime-timeout": test_poststop_hook_on_createruntime_timeout,
 }
 
 if __name__ == "__main__":

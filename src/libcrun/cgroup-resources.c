@@ -60,12 +60,6 @@ get_default_devices ()
   return default_devices;
 }
 
-static inline int
-write_cgroup_file (int dirfd, const char *name, const void *data, size_t len, libcrun_error_t *err)
-{
-  return write_file_at_with_flags (dirfd, O_WRONLY | O_CLOEXEC, 0, name, data, len, err);
-}
-
 static int
 write_cgroup_file_or_alias (int dirfd, const char *name, const char *alias, const void *data, size_t len, libcrun_error_t *err)
 {
@@ -105,6 +99,9 @@ is_rwm (const char *str, libcrun_error_t *err)
   bool r = false;
   bool w = false;
   bool m = false;
+
+  if (str == NULL)
+    str = "";
 
   for (it = str; *it; it++)
     switch (*it)
@@ -482,7 +479,7 @@ write_network_resources (int dirfd_netclass, int dirfd_netprio, runtime_spec_sch
   int ret;
   if (net->class_id)
     {
-      len = snprintf (fmt_buf, sizeof (fmt_buf), "%d", net->class_id);
+      len = snprintf (fmt_buf, sizeof (fmt_buf), "%" PRIu32, net->class_id);
       if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
         return crun_make_error (err, 0, "internal error: static buffer too small");
 
@@ -500,7 +497,8 @@ write_network_resources (int dirfd_netclass, int dirfd_netprio, runtime_spec_sch
 
       for (i = 0; i < net->priorities_len; i++)
         {
-          len = snprintf (fmt_buf, sizeof (fmt_buf), "%s %d\n", net->priorities[i]->name, net->priorities[i]->priority);
+          len = snprintf (fmt_buf, sizeof (fmt_buf), "%s %" PRIu32 "\n", net->priorities[i]->name,
+                          net->priorities[i]->priority);
           if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
             return crun_make_error (err, 0, "internal error: static buffer too small");
 
@@ -518,16 +516,16 @@ write_hugetlb_resources (int dirfd, bool cgroup2,
                          runtime_spec_schema_config_linux_resources_hugepage_limits_element **htlb, size_t htlb_len,
                          libcrun_error_t *err)
 {
+  const char *suffix = cgroup2 ? "max" : "limit_in_bytes";
+  bool skip_rsvd = false;
   char fmt_buf[128];
   size_t i;
   for (i = 0; i < htlb_len; i++)
     {
       cleanup_free char *filename = NULL;
-      const char *suffix;
+      cleanup_free char *rsvd_filename = NULL;
       int len;
       int ret;
-
-      suffix = cgroup2 ? "max" : "limit_in_bytes";
 
       xasprintf (&filename, "hugetlb.%s.%s", htlb[i]->page_size, suffix);
 
@@ -537,6 +535,20 @@ write_hugetlb_resources (int dirfd, bool cgroup2,
       ret = write_file_and_check_controllers_at (cgroup2, dirfd, filename, NULL, fmt_buf, len, err);
       if (UNLIKELY (ret < 0))
         return ret;
+
+      if (skip_rsvd)
+        continue;
+
+      /* Reservation accounting (Linux >= 5.7) is used when available.  */
+      xasprintf (&rsvd_filename, "hugetlb.%s.rsvd.%s", htlb[i]->page_size, suffix);
+      ret = write_cgroup_file (dirfd, rsvd_filename, fmt_buf, len, err);
+      if (UNLIKELY (ret < 0))
+        {
+          if (crun_error_get_errno (err) != ENOENT)
+            return ret;
+          crun_error_release (err);
+          skip_rsvd = true;
+        }
     }
   return 0;
 }
@@ -583,8 +595,10 @@ write_devices_resources_v1 (int dirfd, runtime_spec_schema_defs_linux_device_cgr
           FMT_DEV (devs[i]->minor, fmt_buf_minor);
 #undef FMT_DEV
 
+          /* `access` is optional, and libocispec leaves it NULL when it is not
+             specified.  Printing a NULL pointer with %s is undefined.  */
           len = snprintf (fmt_buf, FMT_BUF_LEN, "%s %s:%s %s", devs[i]->type, fmt_buf_major, fmt_buf_minor,
-                          devs[i]->access);
+                          devs[i]->access ? devs[i]->access : "");
           if (UNLIKELY (len >= FMT_BUF_LEN))
             return crun_make_error (err, 0, "internal error: static buffer too small");
         }
@@ -853,40 +867,6 @@ write_memory_resources (int dirfd, bool cgroup2, runtime_spec_schema_config_linu
   char fmt_buf[32];
   bool memory_limits_written = false;
 
-  if (cgroup2 && memory->check_before_update_present && memory->check_before_update)
-    {
-      cleanup_free char *swap_current = NULL;
-      cleanup_free char *current = NULL;
-      uint64_t limit = 0;
-      uint64_t val, val_swap;
-      int ret;
-
-      ret = read_all_file_at (dirfd, "memory.current", &current, NULL, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
-      ret = read_all_file_at (dirfd, "memory.swap.current", &swap_current, NULL, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-
-      errno = 0;
-      val = strtoll (current, NULL, 10);
-      if (UNLIKELY (errno))
-        return crun_make_error (err, errno, "parse memory.current");
-
-      val_swap = strtoll (swap_current, NULL, 10);
-      if (UNLIKELY (errno))
-        return crun_make_error (err, errno, "parse memory.swap.current");
-
-      if (memory->limit_present && memory->limit >= 0)
-        limit = memory->limit;
-      if (memory->swap_present && memory->swap >= 0)
-        limit += memory->swap;
-
-      if (limit <= val + val_swap)
-        return crun_make_error (err, 0, "cannot set the memory limit lower than its current usage");
-    }
-
   if (memory->limit_present)
     {
       ret = write_memory (dirfd, cgroup2, memory, err);
@@ -992,6 +972,21 @@ write_memory_resources (int dirfd, bool cgroup2, runtime_spec_schema_config_linu
 }
 
 int
+write_cpu_idle (int cpu_dirfd, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err)
+{
+  char fmt_buf[32];
+  int len;
+
+  if (! cpu->idle_present)
+    return 0;
+
+  len = snprintf (fmt_buf, sizeof (fmt_buf), "%" PRIi64, cpu->idle);
+  if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
+    return crun_make_error (err, 0, "internal error: static buffer too small");
+  return write_cgroup_file (cpu_dirfd, "cpu.idle", fmt_buf, len, err);
+}
+
+int
 write_cpu_burst (int cpu_dirfd, bool cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu,
                  libcrun_error_t *err)
 {
@@ -1033,7 +1028,7 @@ static int
 write_cpu_resources (int dirfd_cpu, bool cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu,
                      libcrun_error_t *err)
 {
-  int len, period_len;
+  int len, period_len = 0;
   int ret;
   char fmt_buf[64];
   int64_t period = -1;
@@ -1045,7 +1040,20 @@ write_cpu_resources (int dirfd_cpu, bool cgroup2, runtime_spec_schema_config_lin
       uint32_t val = cpu->shares;
 
       if (cgroup2)
-        val = convert_shares_to_weight (val);
+        {
+          val = convert_shares_to_weight (val);
+
+          /* The weight cannot be changed while cpu.idle is set, and setting
+             it means the cgroup is not idle (this is what systemd does, too),
+             so reset cpu.idle unless it is also being set.  The file might
+             not exist on older kernels, so ignore errors.  */
+          if (! cpu->idle_present)
+            {
+              ret = write_cgroup_file (dirfd_cpu, "cpu.idle", "0", 1, err);
+              if (UNLIKELY (ret < 0))
+                crun_error_release (err);
+            }
+        }
 
       len = snprintf (fmt_buf, sizeof (fmt_buf), "%u", val);
       if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
@@ -1125,15 +1133,9 @@ write_cpu_resources (int dirfd_cpu, bool cgroup2, runtime_spec_schema_config_lin
       if (UNLIKELY (ret < 0))
         return ret;
     }
-  if (cpu->idle_present)
-    {
-      len = snprintf (fmt_buf, sizeof (fmt_buf), "%" PRIi64, cpu->idle);
-      if (UNLIKELY (len >= (int) sizeof (fmt_buf)))
-        return crun_make_error (err, 0, "internal error: static buffer too small");
-      ret = write_cgroup_file (dirfd_cpu, "cpu.idle", fmt_buf, len, err);
-      if (UNLIKELY (ret < 0))
-        return ret;
-    }
+  ret = write_cpu_idle (dirfd_cpu, cpu, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   if (cgroup2 && (quota > 0 || period > 0))
     {
@@ -1370,7 +1372,7 @@ update_cgroup_v2_resources (runtime_spec_schema_config_linux_resources *resource
   if (UNLIKELY (ret < 0))
     return ret;
 
-  cgroup_dirfd = open (cgroup_path, O_DIRECTORY | O_CLOEXEC);
+  cgroup_dirfd = open (cgroup_path, O_DIRECTORY | O_PATH | O_CLOEXEC);
   if (UNLIKELY (cgroup_dirfd < 0))
     return crun_make_error (err, errno, "open `%s`", cgroup_path);
 
@@ -1425,6 +1427,69 @@ update_cgroup_v2_resources (runtime_spec_schema_config_linux_resources *resource
       if (UNLIKELY (ret < 0))
         return ret;
     }
+
+  return 0;
+}
+
+/* With checkBeforeUpdate, refuse to set the memory limit lower than the
+   current usage.  This must be done before any of the resources is updated,
+   including by the cgroup manager (e.g. the systemd unit properties).  */
+int
+check_memory_before_update (const char *path, runtime_spec_schema_config_linux_resources *resources,
+                            libcrun_error_t *err)
+{
+  runtime_spec_schema_config_linux_resources_memory *memory = resources->memory;
+  cleanup_free char *swap_current = NULL;
+  cleanup_free char *cgroup_path = NULL;
+  cleanup_free char *current = NULL;
+  cleanup_close int dirfd = -1;
+  uint64_t limit = 0;
+  uint64_t val, val_swap;
+  int cgroup_mode;
+  int ret;
+
+  if (path == NULL || memory == NULL || ! (memory->check_before_update_present && memory->check_before_update))
+    return 0;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+
+  if (cgroup_mode != CGROUP_MODE_UNIFIED)
+    return 0;
+
+  ret = append_paths (&cgroup_path, err, CGROUP_ROOT, path, NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  dirfd = open (cgroup_path, O_DIRECTORY | O_PATH | O_CLOEXEC);
+  if (UNLIKELY (dirfd < 0))
+    return crun_make_error (err, errno, "open `%s`", cgroup_path);
+
+  ret = read_all_file_at (dirfd, "memory.current", &current, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = read_all_file_at (dirfd, "memory.swap.current", &swap_current, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  errno = 0;
+  val = strtoll (current, NULL, 10);
+  if (UNLIKELY (errno))
+    return crun_make_error (err, errno, "parse memory.current");
+
+  val_swap = strtoll (swap_current, NULL, 10);
+  if (UNLIKELY (errno))
+    return crun_make_error (err, errno, "parse memory.swap.current");
+
+  if (memory->limit_present && memory->limit >= 0)
+    limit = memory->limit;
+  if (memory->swap_present && memory->swap >= 0)
+    limit += memory->swap;
+
+  if (limit <= val + val_swap)
+    return crun_make_error (err, 0, "cannot set the memory limit lower than its current usage");
 
   return 0;
 }

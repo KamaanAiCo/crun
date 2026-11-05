@@ -5,7 +5,7 @@
 , libcap
 , libseccomp
 , libsystemd
-, yajl
+, json_c
 , criu
 }:
 with pkgs; stdenv.mkDerivation {
@@ -24,31 +24,26 @@ with pkgs; stdenv.mkDerivation {
     python3
     which
   ];
-  buildInputs =
-    (if stdenv.hostPlatform.isMusl then [
-      argp-standalone
-    ] else [
+  buildInputs = [
       glibc
       glibc.static
-    ]) ++ [
+    ] ++ [
       libcap
       libseccomp
       libsystemd
-      yajl
+      json_c
     ] ++ lib.optionals enableCriu [ criu ];
-  configureFlags = [ "--enable-static" ] ++ lib.optional (!enableSystemd) [ "--disable-systemd" ];
+  configureFlags = [ "--enable-static" "--enable-embedded-blake3" ] ++ lib.optional (!enableSystemd) [ "--disable-systemd" ];
   prePatch = let
     staticLibs =
       lib.optional enableCriu "${criu}/lib/libcriu.a"
-      ++ (if stdenv.hostPlatform.isMusl
-          then map (l: "${musl}/lib/${l}") [ "libc.a" "libpthread.a" "librt.a" ]
-          else map (l: "${glibc.static}/lib/${l}") [ "libc.a" "libpthread.a" "librt.a" ])
+      ++ map (l: "${glibc.static}/lib/${l}") [ "libc.a" "libpthread.a" "librt.a" ]
       ++ [
         "${lib.getLib libcap}/lib/libcap.a"
         "${lib.getLib libseccomp}/lib/libseccomp.a"
       ]
       ++ lib.optional enableSystemd "${lib.getLib libsystemd}/lib/libsystemd.a"
-      ++ [ "${yajl}/lib/libyajl.a" ];
+      ++ [ "${json_c}/lib/libjson-c.a" ];
   in ''
     export CFLAGS='-static -pthread -DSTATIC'
     export LDFLAGS='-s -w -static-libgcc -static'

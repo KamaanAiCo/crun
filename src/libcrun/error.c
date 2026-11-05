@@ -26,14 +26,12 @@
 #include <stdio.h>
 #include "utils.h"
 
-#include <yajl/yajl_tree.h>
-#include <yajl/yajl_gen.h>
+#include <json-c/json.h>
+#include <ocispec/json_common.h>
 
 #ifdef HAVE_SYSTEMD
 #  include <systemd/sd-journal.h>
 #endif
-
-#define YAJL_STR(x) ((const unsigned char *) (x))
 
 enum
 {
@@ -99,7 +97,9 @@ crun_error_wrap (libcrun_error_t *err, const char *fmt, ...)
 int
 crun_error_release (libcrun_error_t *err)
 {
+  const int saved_errno = errno;
   libcrun_error_t ptr;
+
   if (err == NULL)
     return 0;
 
@@ -110,6 +110,8 @@ crun_error_release (libcrun_error_t *err)
   free (ptr->msg);
   free (ptr);
   *err = NULL;
+
+  errno = saved_errno;
   return 0;
 }
 
@@ -119,9 +121,26 @@ libcrun_error_release (libcrun_error_t *err)
   return crun_error_release (err);
 }
 
+int
+libcrun_error_get_status (libcrun_error_t err)
+{
+  if (err == NULL)
+    return 0;
+  return err->status;
+}
+
+const char *
+libcrun_error_get_message (libcrun_error_t err)
+{
+  if (err == NULL)
+    return NULL;
+  return err->msg;
+}
+
 void
 crun_error_write_warning_and_release (FILE *out, libcrun_error_t **err)
 {
+  const int saved_errno = errno;
   libcrun_error_t ref;
 
   if (out == NULL)
@@ -141,12 +160,27 @@ crun_error_write_warning_and_release (FILE *out, libcrun_error_t **err)
   free (ref->msg);
   free (ref);
   **err = NULL;
+
+  errno = saved_errno;
 }
 
 void
 libcrun_error_write_warning_and_release (FILE *out, libcrun_error_t **err)
 {
   return crun_error_write_warning_and_release (out, err);
+}
+
+void
+libcrun_error_report_and_release (libcrun_error_t *err)
+{
+  libcrun_error_t ref;
+
+  if (err == NULL || *err == NULL)
+    return;
+
+  ref = *err;
+  libcrun_error (ref->status, "%s", ref->msg);
+  crun_error_release (err);
 }
 
 int
@@ -174,6 +208,20 @@ get_timestamp (timestamp_t *timestamp, const char *suffix)
   snprintf (buffer + written, buffer_size - written, ".%06lldZ%.8s", (long long int) tv.tv_usec, suffix);
 }
 
+/* Neither openlog(3) nor the journald handler copy the identifier they are
+   given, and the global output handler outlives the caller's strings (e.g.
+   the context is freed while errors are still reported through it), so keep
+   an owned copy alive for as long as the handler can use it.  */
+static char *log_id;
+
+static const char *
+set_log_id (const char *id, char **old_id)
+{
+  *old_id = log_id;
+  log_id = id ? xstrdup (id) : NULL;
+  return log_id;
+}
+
 static void *
 init_syslog (const char *id)
 {
@@ -191,7 +239,7 @@ enum
 static int
 get_log_type (const char *log, const char **data)
 {
-  char *sep = strchr (log, ':');
+  const char *sep = strchr (log, ':');
   if (sep == NULL)
     {
       *data = log;
@@ -213,6 +261,9 @@ int
 libcrun_init_logging (crun_output_handler *new_output_handler, void **new_output_handler_arg, const char *id,
                       const char *log, libcrun_error_t *err)
 {
+  /* Released only after the new handler is installed.  */
+  cleanup_free char *old_log_id = NULL;
+
   if (log == NULL)
     {
       *new_output_handler = log_write_to_stderr;
@@ -224,7 +275,7 @@ libcrun_init_logging (crun_output_handler *new_output_handler, void **new_output
       int log_type = get_log_type (log, &arg);
 
       if (log_type < 0)
-        return crun_make_error (err, errno, "unknown log type `%s`", log);
+        return crun_make_error (err, 0, "unknown log type `%s`", log);
 
       switch (log_type)
         {
@@ -238,13 +289,13 @@ libcrun_init_logging (crun_output_handler *new_output_handler, void **new_output
           break;
 
         case LOG_TYPE_SYSLOG:
-          *new_output_handler_arg = init_syslog (arg[0] ? arg : id);
+          *new_output_handler_arg = init_syslog (set_log_id (arg[0] ? arg : id, &old_log_id));
           *new_output_handler = log_write_to_syslog;
           break;
 
         case LOG_TYPE_JOURNALD:
           *new_output_handler = log_write_to_journald;
-          *new_output_handler_arg = (void *) id;
+          *new_output_handler_arg = (void *) set_log_id (id, &old_log_id);
           break;
         }
     }
@@ -385,46 +436,45 @@ make_json_error (const char *msg, int errno_, int verbosity)
       level = "error";
       break;
     }
-  const unsigned char *buf = NULL;
-  yajl_gen gen = NULL;
+  const char *buf = NULL;
+  json_gen_ctx *gen = NULL;
   char *ret = NULL;
   size_t buf_len;
   timestamp_t timestamp = {
     0,
   };
 
-  gen = yajl_gen_alloc (NULL);
-  if (gen == NULL)
+  if (! json_gen_init (&gen, NULL))
     return NULL;
 
   get_timestamp (&timestamp, "");
 
-  yajl_gen_map_open (gen);
+  json_gen_map_open (gen);
 
-  yajl_gen_string (gen, YAJL_STR ("msg"), strlen ("msg"));
+  json_gen_string (gen, "msg", strlen ("msg"));
   if (errno_ == 0)
-    yajl_gen_string (gen, YAJL_STR (msg), strlen (msg));
+    json_gen_string (gen, msg, strlen (msg));
   else
     {
       cleanup_free char *tmp = NULL;
 
       xasprintf (&tmp, "%s: %s", msg, strerror (errno_));
-      yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
+      json_gen_string (gen, tmp, strlen (tmp));
     }
 
-  yajl_gen_string (gen, YAJL_STR ("level"), strlen ("level"));
-  yajl_gen_string (gen, YAJL_STR (level), strlen (level));
+  json_gen_string (gen, "level", strlen ("level"));
+  json_gen_string (gen, level, strlen (level));
 
-  yajl_gen_string (gen, YAJL_STR ("time"), strlen ("time"));
-  yajl_gen_string (gen, YAJL_STR (timestamp), strlen (timestamp));
+  json_gen_string (gen, "time", strlen ("time"));
+  json_gen_string (gen, timestamp, strlen (timestamp));
 
-  yajl_gen_map_close (gen);
+  json_gen_map_close (gen);
 
-  yajl_gen_get_buf (gen, &buf, &buf_len);
+  json_gen_get_buf (gen, &buf, &buf_len);
   if (buf)
-    ret = strdup ((const char *) buf);
+    ret = strdup (buf);
 
-  yajl_gen_free (gen);
+  json_gen_free (gen);
 
   return ret;
 }
@@ -514,35 +564,14 @@ libcrun_set_log_format (const char *format, libcrun_error_t *err)
 }
 
 int
-yajl_error_to_crun_error (int yajl_status, libcrun_error_t *err)
+json_gen_error_to_crun_error (int status, libcrun_error_t *err)
 {
-  switch (yajl_status)
+  switch (status)
     {
-    case yajl_gen_status_ok:
+    case json_gen_status_ok:
       return 0;
 
-    case yajl_gen_keys_must_be_strings:
-      return crun_make_error (err, 0, "generate JSON document: gen keys must be strings");
-
-    case yajl_max_depth_exceeded:
-      return crun_make_error (err, 0, "generate JSON document: max depth exceeded");
-
-    case yajl_gen_in_error_state:
-      return crun_make_error (err, 0, "generate JSON document: complete JSON document generated");
-
-    case yajl_gen_generation_complete:
-      return crun_make_error (err, 0, "generate JSON document: called while in error state");
-
-    case yajl_gen_invalid_number:
-      return crun_make_error (err, 0, "generate JSON document: invalid number");
-
-    case yajl_gen_no_buf:
-      return crun_make_error (err, 0, "generate JSON document: no buffer provided");
-
-    case yajl_gen_invalid_string:
-      return crun_make_error (err, 0, "generate JSON document: invalid string");
-
     default:
-      return crun_make_error (err, 0, "generate JSON document");
+      return crun_make_error (err, 0, "generate JSON document: error %d", status);
     }
 }

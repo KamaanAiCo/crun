@@ -28,6 +28,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -38,6 +39,7 @@
 #include <sys/types.h>
 #include <sched.h>
 
+#include <linux/keyctl.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <netinet/in.h>
@@ -185,6 +187,7 @@ check_idmapped_mounts (const char *path)
     0,
   };
   char proc_path[64];
+  pid_t ppid = getpid ();
   int open_tree_fd;
   pid_t pid;
   int fd;
@@ -195,6 +198,9 @@ check_idmapped_mounts (const char *path)
   if (pid == 0)
     {
       prctl (PR_SET_PDEATHSIG, SIGKILL);
+      /* The parent might have exited before PR_SET_PDEATHSIG was set.  */
+      if (getppid () != ppid)
+        _exit (EXIT_SUCCESS);
       while (1)
         pause ();
       _exit (EXIT_SUCCESS);
@@ -308,8 +314,9 @@ sd_notify ()
     error (EXIT_FAILURE, errno, "socket");
 
   notify_socket_unix_name.sun_family = AF_UNIX;
-  strncpy (notify_socket_unix_name.sun_path, notify_socket_name,
-           sizeof (notify_socket_unix_name.sun_path));
+  if (strlen (notify_socket_name) >= sizeof (notify_socket_unix_name.sun_path))
+    error (EXIT_FAILURE, 0, "NOTIFY_SOCKET is too long");
+  strcpy (notify_socket_unix_name.sun_path, notify_socket_name);
 
   ret = sendto (notify_socket_fd, ready_data, ready_data_len, 0,
                 (struct sockaddr *) &notify_socket_unix_name, sizeof (notify_socket_unix_name));
@@ -324,6 +331,16 @@ static int
 syscall_seccomp (unsigned int operation, unsigned int flags, void *args)
 {
   return (int) syscall (__NR_seccomp, operation, flags, args);
+}
+
+/* Exit status used by the "exit-on-signal" mode below.  */
+#define SIGNAL_EXIT_STATUS 42
+
+static void
+handle_signal (int signum)
+{
+  (void) signum;
+  _exit (SIGNAL_EXIT_STATUS);
 }
 
 static void
@@ -341,29 +358,59 @@ do_pause ()
 }
 
 static int
+pause_thread (void *arg)
+{
+  (void) arg;
+  do_pause ();
+  return 0;
+}
+
+static void
+fork_and_exit_main_thread ()
+{
+  static char stack[64 * 1024] __attribute__ ((aligned (16)));
+  const int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+  pid_t pid;
+
+  pid = fork ();
+  if (pid < 0)
+    error (EXIT_FAILURE, errno, "fork");
+
+  if (pid == 0)
+    {
+      if (clone (pause_thread, stack + sizeof (stack), flags, NULL) < 0)
+        error (EXIT_FAILURE, errno, "clone");
+
+      close (1);
+      close (2);
+
+      /* Terminate only the main thread, not the whole thread group.  */
+      syscall (__NR_exit, 0);
+    }
+}
+
+static int
 memhog (int megabytes)
 {
+  size_t page_size, size, pos;
   char *buf;
-  int pos = 0;
 
   if (megabytes < 1)
     error (EXIT_FAILURE, 0, "memhog argument needs to be at least 1");
 
-  buf = malloc (megabytes * 1024 * 1024);
+  page_size = (size_t) sysconf (_SC_PAGESIZE);
+  size = (size_t) megabytes * 1024 * 1024;
+
+  buf = malloc (size);
   if (buf == NULL)
     error (EXIT_FAILURE, 0, "malloc");
 
   close (1);
   close (2);
 
-  while (1)
-    {
-      /* write each page once */
-      buf[pos] = 'c';
-      pos += sysconf (_SC_PAGESIZE);
-      if (pos > megabytes * 1024 * 1024)
-        break;
-    }
+  /* write each page once */
+  for (pos = 0; pos < size; pos += page_size)
+    buf[pos] = 'c';
 
   pos = 0;
 
@@ -372,8 +419,8 @@ memhog (int megabytes)
       /* change one page each 0.1 seconds */
       nanosleep ((const struct timespec[]) { { 0, 100000000L } }, NULL);
       buf[pos] = 'c';
-      pos += sysconf (_SC_PAGESIZE);
-      if (pos > megabytes * 1024 * 1024)
+      pos += page_size;
+      if (pos >= size)
         pos = 0;
     }
 
@@ -404,6 +451,7 @@ dump_net_interface (const char *ifname)
   if (buffer == NULL)
     error (EXIT_FAILURE, errno, "malloc");
 
+  memset (&sa, 0, sizeof (sa));
   sa.nl_family = AF_NETLINK;
 
   if (bind (sock, (struct sockaddr *) &sa, sizeof (sa)) < 0)
@@ -441,7 +489,7 @@ dump_net_interface (const char *ifname)
             error (EXIT_FAILURE, 0, "netlink error");
 
           ifa = NLMSG_DATA (nlh);
-          if (ifa->ifa_index != ifindex)
+          if (ifa->ifa_index != (unsigned int) ifindex)
             continue;
 
           rta_it = IFA_RTA (ifa);
@@ -454,10 +502,11 @@ dump_net_interface (const char *ifname)
               rta_it = RTA_NEXT (rta_it, rta_len);
             }
 
-          if (rta[IFA_ADDRESS])
+          if (rta[IFA_LOCAL] || rta[IFA_ADDRESS])
             {
+              struct rtattr *attr = rta[IFA_LOCAL] ? rta[IFA_LOCAL] : rta[IFA_ADDRESS];
               char addr[INET_ADDRSTRLEN];
-              inet_ntop (AF_INET, RTA_DATA (rta[IFA_LOCAL]), addr, sizeof (addr));
+              inet_ntop (AF_INET, RTA_DATA (attr), addr, sizeof (addr));
               printf ("address: %s/%d\n", addr, ifa->ifa_prefixlen);
             }
           if (rta[IFA_BROADCAST])
@@ -500,11 +549,30 @@ main (int argc, char **argv)
       exit (0);
     }
 
+  if (strcmp (argv[1], "socket") == 0)
+    {
+      int fd;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'socket' requires an argument");
+
+      fd = socket (atoi (argv[2]), SOCK_DGRAM, 0);
+      if (fd < 0)
+        error (EXIT_FAILURE, errno, "socket");
+      close (fd);
+      return 0;
+    }
+
   if (strcmp (argv[1], "printenv") == 0)
     {
+      const char *value;
+
       if (argc < 3)
         error (EXIT_FAILURE, 0, "'printenv' requires an argument");
-      fputs (getenv (argv[2]), stdout);
+      value = getenv (argv[2]);
+      if (value == NULL)
+        error (EXIT_FAILURE, 0, "environment variable `%s` is not set", argv[2]);
+      fputs (value, stdout);
       exit (0);
     }
 
@@ -557,6 +625,13 @@ main (int argc, char **argv)
       if (argc < 3)
         error (EXIT_FAILURE, 0, "'openwronly' requires an argument");
       return open_only (argv[2], O_WRONLY);
+    }
+
+  if (strcmp (argv[1], "openrdwr") == 0)
+    {
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'openrdwr' requires an argument");
+      return open_only (argv[2], O_RDWR);
     }
 
   if (strcmp (argv[1], "access") == 0)
@@ -679,6 +754,32 @@ main (int argc, char **argv)
       return 0;
     }
 
+  if (strcmp (argv[1], "nlink") == 0)
+    {
+      struct stat st;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'nlink' requires a path argument");
+      if (stat (argv[2], &st) < 0)
+        error (EXIT_FAILURE, errno, "stat %s", argv[2]);
+
+      printf ("%lu\n", (unsigned long) st.st_nlink);
+      return 0;
+    }
+
+  if (strcmp (argv[1], "isdir") == 0)
+    {
+      struct stat st;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'isdir' requires a path argument");
+      if (stat (argv[2], &st) < 0)
+        error (EXIT_FAILURE, errno, "stat %s", argv[2]);
+
+      printf ("%d\n", S_ISDIR (st.st_mode) ? 1 : 0);
+      return 0;
+    }
+
   if (strcmp (argv[1], "id") == 0)
     {
       int ret;
@@ -742,7 +843,7 @@ main (int argc, char **argv)
 
   if (strcmp (argv[1], "ip") == 0)
     {
-      if (argc < 2)
+      if (argc < 3)
         error (EXIT_FAILURE, 0, "'ip' requires an argument");
       dump_net_interface (argv[2]);
       exit (EXIT_SUCCESS);
@@ -750,13 +851,95 @@ main (int argc, char **argv)
 
   if (strcmp (argv[1], "write") == 0)
     {
-      if (argc < 3)
+      if (argc < 4)
         error (EXIT_FAILURE, 0, "'write' requires two arguments");
       write_to (argv[2], argv[3]);
       exit (EXIT_SUCCESS);
     }
   if (strcmp (argv[1], "pause") == 0)
     {
+      do_pause ();
+    }
+  if (strcmp (argv[1], "long-stdin-path") == 0)
+    {
+      /* Once the file "restored" shows up in the specified directory, replace
+         the stdin with a file whose path is longer than PATH_MAX.  CRIU cannot
+         checkpoint such a file, so until then keep open only its grandparent
+         directory, whose path is short enough.  */
+      char name[NAME_MAX + 1], file[NAME_MAX + 3];
+      int basefd, dirfd, fd, i;
+
+      if (argc < 3)
+        error (EXIT_FAILURE, 0, "'long-stdin-path' requires an argument");
+
+      memset (name, 'a', NAME_MAX);
+      name[NAME_MAX] = '\0';
+      snprintf (file, sizeof (file), "%s/f", name);
+
+      basefd = open (argv[2], O_RDONLY | O_DIRECTORY);
+      if (basefd < 0 || fchdir (basefd) < 0)
+        error (EXIT_FAILURE, errno, "open `%s`", argv[2]);
+      for (i = 0; i < PATH_MAX / (NAME_MAX + 1) - 1; i++)
+        if (mkdir (name, 0700) < 0 || chdir (name) < 0)
+          error (EXIT_FAILURE, errno, "mkdir");
+      dirfd = open (".", O_RDONLY | O_DIRECTORY);
+      if (dirfd < 0 || mkdir (name, 0700) < 0)
+        error (EXIT_FAILURE, errno, "mkdir");
+      fd = open (file, O_CREAT | O_WRONLY, 0600);
+      if (fd < 0 || chdir ("/") < 0)
+        error (EXIT_FAILURE, errno, "create file");
+      close (fd);
+
+      fd = openat (basefd, "ready", O_CREAT | O_WRONLY, 0600);
+      if (fd < 0)
+        error (EXIT_FAILURE, errno, "create `ready`");
+      close (fd);
+
+      while (faccessat (basefd, "restored", F_OK, 0) < 0)
+        nanosleep ((const struct timespec[]) { { 0, 10000000L } }, NULL);
+
+      fd = openat (dirfd, file, O_RDONLY);
+      if (fd < 0 || dup2 (fd, 0) < 0)
+        error (EXIT_FAILURE, errno, "replace stdin");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "fork-and-exit-main-thread") == 0)
+    {
+      fork_and_exit_main_thread ();
+      do_pause ();
+    }
+  if (strcmp (argv[1], "exit-on-signal") == 0)
+    {
+      /* Exit with a distinctive status once SIGUSR1 is received.  Unlike a
+         signal with a default disposition, this works for a PID 1 as well,
+         since the kernel does not apply the default disposition to it.  */
+      if (signal (SIGUSR1, handle_signal) == SIG_ERR)
+        error (EXIT_FAILURE, errno, "signal SIGUSR1");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "exit-main-thread") == 0)
+    {
+      /* Leave the thread group leader as a zombie while another thread of
+         the process keeps running.  */
+      static char stack[64 * 1024] __attribute__ ((aligned (16)));
+      int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+
+      if (clone (pause_thread, stack + sizeof (stack), flags, NULL) < 0)
+        error (EXIT_FAILURE, errno, "clone");
+      syscall (__NR_exit, 0);
+    }
+  if (strcmp (argv[1], "nested-userns") == 0)
+    {
+      /* Move to a new user namespace, keeping the mount namespace.  */
+      if (unshare (CLONE_NEWUSER) < 0)
+        error (EXIT_FAILURE, errno, "unshare");
+      do_pause ();
+    }
+  if (strcmp (argv[1], "nested-userns-mountns") == 0)
+    {
+      /* Move to a mount namespace owned by a new user namespace.  */
+      if (unshare (CLONE_NEWUSER | CLONE_NEWNS) < 0)
+        error (EXIT_FAILURE, errno, "unshare");
       do_pause ();
     }
   if (strcmp (argv[1], "memhog") == 0)
@@ -770,15 +953,21 @@ main (int argc, char **argv)
       char path[PATH_MAX];
       int ret;
       int fd;
+      int i;
 
       if (argc < 3)
         error (EXIT_FAILURE, 0, "'create-sub-cgroup-and-wait' requires an argument");
 
-      snprintf (path, sizeof (path), "/sys/fs/cgroup/%s", argv[2]);
-      ret = mkdir (path, 0700);
-      if (ret < 0)
-        error (EXIT_FAILURE, errno, "mkdir");
+      /* Create all requested subcgroups.  */
+      for (i = 2; i < argc; i++)
+        {
+          snprintf (path, sizeof (path), "/sys/fs/cgroup/%s", argv[i]);
+          ret = mkdir (path, 0700);
+          if (ret < 0)
+            error (EXIT_FAILURE, errno, "mkdir `%s`", path);
+        }
 
+      /* Move into the first subcgroup.  */
       snprintf (path, sizeof (path), "/sys/fs/cgroup/%s/cgroup.procs", argv[2]);
 
       fd = open (path, O_WRONLY);
@@ -786,7 +975,7 @@ main (int argc, char **argv)
         error (EXIT_FAILURE, errno, "open `%s`", path);
       ret = write (fd, "1", 1);
       if (ret < 0)
-        error (EXIT_FAILURE, errno, "open `%s`", path);
+        error (EXIT_FAILURE, errno, "write `%s`", path);
       close (fd);
 
       do_pause ();
@@ -805,7 +994,10 @@ main (int argc, char **argv)
           if (pid < 0)
             error (EXIT_FAILURE, errno, "fork");
           if (pid == 0)
-            sleep (100);
+            {
+              sleep (100);
+              _exit (EXIT_SUCCESS);
+            }
         }
 
       return 0;
@@ -862,6 +1054,15 @@ main (int argc, char **argv)
       return 0;
     }
 
+  if (strcmp (argv[1], "session-keyring") == 0)
+    {
+      long id = syscall (__NR_keyctl, KEYCTL_GET_KEYRING_ID, KEY_SPEC_SESSION_KEYRING, 0);
+      if (id < 0)
+        error (EXIT_FAILURE, errno, "keyctl");
+      printf ("%ld\n", id);
+      return 0;
+    }
+
   if (strcmp (argv[1], "check-feature") == 0)
     {
       if (argc < 3)
@@ -900,6 +1101,19 @@ main (int argc, char **argv)
 
           ret = syscall (__NR_move_mount);
           return (ret >= 0 || errno != ENOSYS) ? 0 : 1;
+#else
+          return 1;
+#endif
+        }
+      else if (strcmp (argv[2], "openat2") == 0)
+        {
+#if defined __NR_openat2
+          /* struct open_how: flags, mode, resolve.  */
+          uint64_t how[3] = { O_PATH | O_CLOEXEC, 0, 0 };
+          int ret;
+
+          ret = syscall (__NR_openat2, AT_FDCWD, "/", how, sizeof (how));
+          return ret >= 0 ? 0 : 1;
 #else
           return 1;
 #endif

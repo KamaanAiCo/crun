@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <string.h>
 
-typedef int (*test) ();
+#include "tap.h"
 
 extern int compare_rdt_configurations (const char *a, const char *b);
 extern char *intelrdt_clean_l3_cache_schema (const char *l3_cache_schema);
@@ -49,7 +49,10 @@ test_intelrdt_clean_l3_cache_schema ()
   do                                                  \
     {                                                 \
       char *res = intelrdt_clean_l3_cache_schema (X); \
-      int r = strcmp (res, Y);                        \
+      int r;                                          \
+      if (res == NULL)                                \
+        return 1;                                     \
+      r = strcmp (res, Y);                            \
       free (res);                                     \
       if (r)                                          \
         return 1;                                     \
@@ -84,7 +87,9 @@ test_get_rdt_value ()
     {                                                    \
       char *result = NULL;                               \
       int r = get_rdt_value (&result, L3, MB, SCHEMATA); \
-      if (strlen (result) != r)                          \
+      if (r < 0 || result == NULL)                       \
+        return 1;                                        \
+      if (strlen (result) != (size_t) r)                 \
         return 1;                                        \
       int cmp = strcmp (result, EXPECTED);               \
       free (result);                                     \
@@ -128,31 +133,12 @@ test_get_rdt_value ()
   return 0;
 }
 
-static void
-run_and_print_test_result (const char *name, int id, test t)
-{
-  int ret = t ();
-  if (ret == 0)
-    printf ("ok %d - %s\n", id, name);
-  else if (ret == 77)
-    printf ("ok %d - %s #SKIP\n", id, name);
-  else
-    printf ("not ok %d - %s\n", id, name);
-}
-
-#define RUN_TEST(T)                            \
-  do                                           \
-    {                                          \
-      run_and_print_test_result (#T, id++, T); \
-  } while (0)
-
 int
 main ()
 {
-  int id = 1;
-  printf ("1..3\n");
   RUN_TEST (test_compare_rdt_configurations);
   RUN_TEST (test_intelrdt_clean_l3_cache_schema);
   RUN_TEST (test_get_rdt_value);
+  print_tap_plan ();
   return 0;
 }

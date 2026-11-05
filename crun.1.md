@@ -31,10 +31,10 @@ Exec a command in a running container.
 List known containers.
 
 **mounts add**
-Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container.  The command is experimental and can be changed without notice.
+Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container; symlinks in its destination path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 **mounts remove**
-Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used.  The command is experimental and can be changed without notice.
+Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used; symlinks in its path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 **kill**
 Send the specified signal to the container init process.  If no signal
@@ -108,16 +108,14 @@ Define the format of the log messages.  It can either be **text**, or
 Define the log level.  It can either be **debug**, **warning** or **error**.
 The default is **error**.
 
-**--no-pivot**
-Use `chroot(2)` instead of `pivot_root(2)` when creating the container.
-This option is not safe, and should be avoided.
-
 **--root**=_DIR_
 Defines where to store the state for crun containers.
 
 **--systemd-cgroup**
 Use systemd for configuring cgroups.  If not specified, the cgroup is
-created directly using the cgroupfs backend.
+created directly using the cgroupfs backend.  Same as
+**--cgroup-manager**=**systemd**; it conflicts with any other
+**--cgroup-manager** value.
 
 **--cgroup-manager**=_MANAGER_
 Specify what cgroup manager must be used.  Permitted values are **cgroupfs**,
@@ -149,6 +147,10 @@ the container.
 **--no-new-keyring**
 Keep the same session key
 
+**--no-pivot**
+Use `chroot(2)` instead of `pivot_root(2)` when creating the container.
+This option is not safe, and should be avoided.
+
 **--preserve-fds**=_N_
 Additional number of FDs to pass into the container.
 
@@ -172,6 +174,10 @@ the container.
 **--no-new-keyring**
 Keep the same session key.
 
+**--no-pivot**
+Use `chroot(2)` instead of `pivot_root(2)` when creating the container.
+This option is not safe, and should be avoided.
+
 **--preserve-fds**=_N_
 Additional number of FDs to pass into the container.
 
@@ -188,8 +194,8 @@ crun [global options] delete [options] CONTAINER
 **--force**
 Delete the container even if it is still running.
 
-**--regex**=_REGEX_
-Delete all the containers that satisfy the specified regex.
+**--regex**
+Treat _CONTAINER_ as a regular expression and delete all matching containers.
 
 ## EXEC OPTIONS
 
@@ -236,7 +242,7 @@ Path to the file that will contain the new process PID.
 **-t** **--tty**
 Allocate a pseudo TTY.
 
-**-u _USERSPEC_ **--user**=_USERSPEC_
+**-u** _USERSPEC_ **--user**=_USERSPEC_
 Specify the user in the form UID[:GID].
 
 ## LIST OPTIONS
@@ -253,8 +259,8 @@ crun [global options] kill [options] CONTAINER SIGNAL
 **--all**
 Kill all the processes in the container.
 
-**--regex**=_REGEX_
-Kill all the containers that satisfy the specified regex.
+**--regex**
+Treat _CONTAINER_ as a regular expression and send the specified signal to all matching containers.
 
 ## PS OPTIONS
 
@@ -407,6 +413,9 @@ with the specified value. This is useful when restoring
 a container into an existing Pod and selinux labels
 need to be changed during restore.
 
+**--no-new-keyring**
+Keep the same session key.
+
 # Extensions to OCI
 
 ## `run.oci.mount_context_type=context`
@@ -419,7 +428,7 @@ Valid context types are:
   defcontext
   rootcontext
 
-More information on how the context mount flags works see the `mount(8)` man page.
+More information on how the context mount flags work can be found in the `mount(8)` man page.
 
 ## `run.oci.seccomp.receiver=PATH`
 
@@ -596,7 +605,7 @@ rather than the file or directory the symbolic link points to.
 ## r$FLAG mount options
 
 If a `r$FLAG` mount option is specified then the flag `$FLAG` is set
-recursively for each children mount.
+recursively for each child mount.
 
 These flags are supported:
 
@@ -686,7 +695,7 @@ a case, there won't be any error reported.
 
 ## Automatically create user namespace
 
-When running as user different than root, an user namespace is
+When running as a user other than root, a user namespace is
 automatically created even if it is not specified in the config file.
 The current user is mapped to the ID 0 in the container, and any
 additional id specified in the files `/etc/subuid` and `/etc/subgid`

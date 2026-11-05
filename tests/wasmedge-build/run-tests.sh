@@ -11,29 +11,32 @@ rm -rf /usr/bin/crun /usr/local/bin/crun-wasm /usr/bin/crun-wasm
 git config --global --add safe.directory /crun
 git clean -fdx
 ./autogen.sh
-./configure CFLAGS='-Wall -Wextra -Werror' --with-wasmedge --prefix=/usr
+./configure --enable-embedded-blake3 --enable-werror --with-wasmedge --prefix=/usr
 make -j "$(nproc)"
 make install
 
 # Test crun is used in podman
 if [[ $(podman info | grep SYSTEMD) != *WASM:wasmedge* ]]; then
-	echo "podman cannot find the built crun with +WASM:wasmedge"
-	exit 1
+    echo "podman cannot find the built crun with +WASM:wasmedge"
+    exit 1
 fi
 
-# Build hellowasm image
-cd /hello_wasm && \
-	chmod +x ./hello.wasm && \
-	buildah build --platform wasi/wasm -t hellowasm-image .
+# Build hellowasm image. Buildah mounts an overlay over the build context,
+# and its upper directory, under TMPDIR, must not be on the overlay
+# filesystem the container root (and thus /var/tmp) is on.
+mkdir -p /var/lib/containers/tmp
+cd /hello_wasm &&
+    chmod +x ./hello.wasm &&
+    TMPDIR=/var/lib/containers/tmp buildah build --platform wasi/wasm -t hellowasm-image .
 
 # Run hello.wasm with crun
 OUTPUT=$(podman run hellowasm-image:latest)
 FILE1="tmp.output"
 FILE2="expected_output"
-echo "$OUTPUT" > "$FILE1"
+echo "$OUTPUT" >"$FILE1"
 if cmp -s "$FILE1" "$FILE2"; then
-	echo "Run wasm success. The execution result is exactly matched"
+    echo "Run wasm success. The execution result is exactly matched"
 else
-	echo "Run wasm failed. The execution result is not matched"
-	exit 1
+    echo "Run wasm failed. The execution result is not matched"
+    exit 1
 fi

@@ -54,7 +54,7 @@ ring_buffer_get_read_iov (struct ring_buffer *rb, struct iovec *iov)
   else
     {
       iov[iov_count].iov_base = rb->buffer + rb->head;
-      iov[iov_count].iov_len = rb->size - rb->head - 1; /* Don't read from reserved byte */
+      iov[iov_count].iov_len = rb->size - rb->head;
       iov_count++;
 
       if (rb->tail > 0)
@@ -92,7 +92,7 @@ ring_buffer_get_write_iov (struct ring_buffer *rb, struct iovec *iov)
   else
     {
       iov[iov_count].iov_base = rb->buffer + rb->tail;
-      iov[iov_count].iov_len = rb->size - rb->tail - 1; /* Don't write to reserved byte */
+      iov[iov_count].iov_len = rb->head == 0 ? rb->size - rb->tail - 1 : rb->size - rb->tail;
       iov_count++;
 
       if (rb->head > 1)
@@ -159,15 +159,18 @@ ring_buffer_read (struct ring_buffer *rb, int fd, bool *is_eagain, libcrun_error
   ret = readv (fd, iov, iov_count);
   if (UNLIKELY (ret < 0))
     {
-      if (errno == EIO)
-        return 0;
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      /* A terminal that was hung up fails with EIO.  As with EAGAIN, there
+         is nothing to read until the state of the fd changes.  */
+      if (errno == EIO || errno == EAGAIN || errno == EWOULDBLOCK)
         {
           *is_eagain = true;
           return 0;
         }
       return crun_make_error (err, errno, "readv");
     }
+  /* The same holds at EOF.  */
+  if (ret == 0)
+    *is_eagain = true;
   ring_buffer_advance_nocheck_tail (rb, ret);
   return ret;
 }
@@ -191,9 +194,9 @@ ring_buffer_write (struct ring_buffer *rb, int fd, bool *is_eagain, libcrun_erro
   ret = writev (fd, iov, iov_count);
   if (UNLIKELY (ret < 0))
     {
-      if (errno == EIO)
-        return 0;
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      /* A terminal that was hung up fails with EIO.  As with EAGAIN, there
+         is nothing to write until the state of the fd changes.  */
+      if (errno == EIO || errno == EAGAIN || errno == EWOULDBLOCK)
         {
           *is_eagain = true;
           return 0;

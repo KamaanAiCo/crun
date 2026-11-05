@@ -30,7 +30,7 @@
         };
         s390x = {
           system = "x86_64-linux";
-          crossSystem.config = "s390x-unknown-linux-musl";
+          crossSystem.config = "s390x-unknown-linux-gnu";
           enableCriu = false;
         };
       };
@@ -72,9 +72,6 @@
             '';
           });
           staticLibseccomp = static pkgs.libseccomp;
-          staticYajl = pkgs.yajl.overrideAttrs (x: {
-            cmakeFlags = (x.cmakeFlags or []) ++ [ "-DBUILD_SHARED_LIBS=OFF" ];
-          });
           staticSystemd = (static pkgs.systemdMinimal).overrideAttrs (x: {
             outputs = [ "out" "dev" ];
             mesonFlags = x.mesonFlags ++ [
@@ -116,7 +113,7 @@
             inherit enableCriu enableSystemd;
             libcap = staticLibcap;
             libseccomp = staticLibseccomp;
-            yajl = staticYajl;
+            json_c = pkgs.json_c;
             libsystemd = staticSystemd;
             criu = staticCriu;
           };

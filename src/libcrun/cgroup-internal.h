@@ -57,6 +57,9 @@ struct libcrun_cgroup_manager
   int (*destroy_cgroup) (struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
   /* Additional resources configuration specific to this manager.  */
   int (*update_resources) (struct libcrun_cgroup_status *cgroup_status, const char *state_root, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err);
+  /* Move PID to the cgroup PATH (the container cgroup or its sub-cgroup) by
+     other means than writing to cgroup.procs.  Optional.  */
+  int (*attach_process) (struct libcrun_cgroup_status *cgroup_status, const char *path, pid_t pid, libcrun_error_t *err);
 };
 
 int move_process_to_cgroup (pid_t pid, const char *subsystem, const char *path, libcrun_error_t *err);
@@ -77,6 +80,12 @@ is_rootless (libcrun_error_t *err)
     return 1;
 
   return check_running_in_user_namespace (err);
+}
+
+static inline int
+write_cgroup_file (int dirfd, const char *name, const void *data, size_t len, libcrun_error_t *err)
+{
+  return write_file_at_with_flags (dirfd, O_WRONLY | O_CLOEXEC, 0, name, data, len, err);
 }
 
 int libcrun_cgroup_pause_unpause_path (const char *cgroup_path, const bool pause, libcrun_error_t *err);
@@ -107,6 +116,7 @@ int initialize_cpuset_subsystem_resources (const char *path, runtime_spec_schema
 
 int write_cpuset_resources (int dirfd_cpuset, int cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err);
 
+int write_cpu_idle (int cpu_dirfd, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err);
 int write_cpu_burst (int cpu_dirfd, bool cgroup2, runtime_spec_schema_config_linux_resources_cpu *cpu, libcrun_error_t *err);
 
 #endif

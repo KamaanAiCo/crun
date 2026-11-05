@@ -1,17 +1,18 @@
 #!/bin/bash
 
 if test "$(id -u)" != 0; then
-	echo "run as root"
-	exit 1
+    echo "run as root"
+    exit 1
 fi
 
 set -e
 (
-cd /crun
-./autogen.sh
-./configure CFLAGS='-Wall -Wextra -Werror'
-make -j "$(nproc)"
-cp crun /usr/bin/runc
+    cd /crun
+    git config --global --add safe.directory /crun
+    ./autogen.sh
+    ./configure --enable-embedded-blake3 --enable-werror
+    make -j "$(nproc)"
+    cp crun /usr/bin/runc
 )
 
 ulimit -u unlimited

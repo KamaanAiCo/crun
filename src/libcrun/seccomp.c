@@ -19,7 +19,6 @@
 #define _GNU_SOURCE
 
 #include <config.h>
-#include "blake3/blake3.h"
 #include "seccomp.h"
 #include "linux.h"
 #include "utils.h"
@@ -37,6 +36,12 @@
 #include <sys/utsname.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+
+#ifdef HAVE_BLAKE3
+#  include <blake3.h>
+#else
+#  include "blake3/blake3.h"
+#endif
 
 #if HAVE_STDATOMIC_H
 #  include <stdatomic.h>
@@ -102,78 +107,150 @@ syscall_seccomp (unsigned int operation, unsigned int flags, void *args)
   return (int) syscall (__NR_seccomp, operation, flags, args);
 }
 
-static unsigned long
-get_seccomp_operator (const char *name, libcrun_error_t *err)
-{
 #ifdef HAVE_SECCOMP
-  if (strcmp (name, "SCMP_CMP_NE") == 0)
-    return SCMP_CMP_NE;
-  if (strcmp (name, "SCMP_CMP_LT") == 0)
-    return SCMP_CMP_LT;
-  if (strcmp (name, "SCMP_CMP_LE") == 0)
-    return SCMP_CMP_LE;
-  if (strcmp (name, "SCMP_CMP_EQ") == 0)
-    return SCMP_CMP_EQ;
-  if (strcmp (name, "SCMP_CMP_GE") == 0)
-    return SCMP_CMP_GE;
-  if (strcmp (name, "SCMP_CMP_GT") == 0)
-    return SCMP_CMP_GT;
-  if (strcmp (name, "SCMP_CMP_MASKED_EQ") == 0)
-    return SCMP_CMP_MASKED_EQ;
-
-  crun_make_error (err, 0, "seccomp get operator `%s`", name);
-  return 0;
-#else
-  return 0;
-#endif
-}
-
-static unsigned long long
-get_seccomp_action (const char *name, int errno_ret, libcrun_error_t *err)
+static int
+get_seccomp_operator (const char *name, enum scmp_compare *op, libcrun_error_t *err)
 {
-#ifdef HAVE_SECCOMP
-  const char *p;
+  static const struct
+  {
+    const char *name;
+    enum scmp_compare op;
+  } operators[] = {
+    { "NE", SCMP_CMP_NE },
+    { "LT", SCMP_CMP_LT },
+    { "LE", SCMP_CMP_LE },
+    { "EQ", SCMP_CMP_EQ },
+    { "GE", SCMP_CMP_GE },
+    { "GT", SCMP_CMP_GT },
+    { "MASKED_EQ", SCMP_CMP_MASKED_EQ },
+  };
+  const char *p = name;
+  size_t i;
 
-  p = name;
-  if (strncmp (p, "SCMP_ACT_", 9))
+  if (! has_prefix (p, "SCMP_CMP_"))
     goto fail;
 
-  p += 9;
+  p += sizeof ("SCMP_CMP_") - 1;
 
-  if (strcmp (p, "ALLOW") == 0)
-    return SCMP_ACT_ALLOW;
-  else if (strcmp (p, "ERRNO") == 0)
-    return SCMP_ACT_ERRNO (errno_ret);
-  else if (strcmp (p, "KILL") == 0)
-    return SCMP_ACT_KILL;
-#  ifdef SCMP_ACT_LOG
-  else if (strcmp (p, "LOG") == 0)
-    return SCMP_ACT_LOG;
-#  endif
-  else if (strcmp (p, "TRAP") == 0)
-    return SCMP_ACT_TRAP;
-  else if (strcmp (p, "TRACE") == 0)
-    return SCMP_ACT_TRACE (errno_ret);
-#  ifdef SCMP_ACT_KILL_PROCESS
-  else if (strcmp (p, "KILL_PROCESS") == 0)
-    return SCMP_ACT_KILL_PROCESS;
-#  endif
-#  ifdef SCMP_ACT_KILL_THREAD
-  else if (strcmp (p, "KILL_THREAD") == 0)
-    return SCMP_ACT_KILL_THREAD;
-#  endif
-#  ifdef SCMP_ACT_NOTIFY
-  else if (strcmp (p, "NOTIFY") == 0)
-    return SCMP_ACT_NOTIFY;
-#  endif
+  for (i = 0; i < sizeof (operators) / sizeof (operators[0]); i++)
+    if (strcmp (p, operators[i].name) == 0)
+      {
+        *op = operators[i].op;
+        return 0;
+      }
 
 fail:
-  crun_make_error (err, 0, "seccomp get action `%s`", name);
-  return 0;
-#else
-  return 0;
-#endif
+  return crun_make_error (err, 0, "seccomp get operator `%s`", name);
 }
+
+static int
+get_seccomp_action (const char *name, int errno_ret, uint32_t *action, libcrun_error_t *err)
+{
+  static const struct
+  {
+    const char *name;
+    uint32_t action;
+  } actions[] = {
+    { "ALLOW", SCMP_ACT_ALLOW },
+    { "KILL", SCMP_ACT_KILL },
+    { "TRAP", SCMP_ACT_TRAP },
+#  ifdef SCMP_ACT_LOG
+    { "LOG", SCMP_ACT_LOG },
+#  endif
+#  ifdef SCMP_ACT_KILL_PROCESS
+    { "KILL_PROCESS", SCMP_ACT_KILL_PROCESS },
+#  endif
+#  ifdef SCMP_ACT_KILL_THREAD
+    { "KILL_THREAD", SCMP_ACT_KILL_THREAD },
+#  endif
+#  ifdef SCMP_ACT_NOTIFY
+    { "NOTIFY", SCMP_ACT_NOTIFY },
+#  endif
+  };
+  const char *p = name;
+  size_t i;
+
+  if (! has_prefix (p, "SCMP_ACT_"))
+    goto fail;
+
+  p += sizeof ("SCMP_ACT_") - 1;
+
+  /* These two embed errno_ret, so they cannot be looked up in the table.  */
+  if (strcmp (p, "ERRNO") == 0)
+    {
+      *action = SCMP_ACT_ERRNO (errno_ret);
+      return 0;
+    }
+  if (strcmp (p, "TRACE") == 0)
+    {
+      *action = SCMP_ACT_TRACE (errno_ret);
+      return 0;
+    }
+
+  for (i = 0; i < sizeof (actions) / sizeof (actions[0]); i++)
+    if (strcmp (p, actions[i].name) == 0)
+      {
+        *action = actions[i].action;
+        return 0;
+      }
+
+fail:
+  return crun_make_error (err, 0, "seccomp get action `%s`", name);
+}
+
+/* seccomp_export_bpf issues a single write and succeeds even when it is
+   short, so retrieve the whole program first and write it with safe_write,
+   which fails on ENOSPC or EFBIG instead of leaving a truncated filter.  */
+static int
+export_bpf (scmp_filter_ctx ctx, int fd, libcrun_error_t *err)
+{
+  cleanup_free char *bpf = NULL;
+  size_t len = 0;
+  int ret;
+
+#  ifdef HAVE_SECCOMP_EXPORT_BPF_MEM
+  ret = seccomp_export_bpf_mem (ctx, NULL, &len);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "seccomp_export_bpf_mem");
+
+  bpf = xmalloc (len);
+
+  ret = seccomp_export_bpf_mem (ctx, bpf, &len);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "seccomp_export_bpf_mem");
+#  else
+  cleanup_close int pipe_r = -1;
+  cleanup_close int pipe_w = -1;
+  int p[2];
+
+  /* A pipe is not affected by the free space or by RLIMIT_FSIZE, the write
+     is short only when it fills the pipe.  */
+  ret = pipe2 (p, O_CLOEXEC | O_NONBLOCK);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "pipe");
+  pipe_r = p[0];
+  pipe_w = p[1];
+
+  ret = seccomp_export_bpf (ctx, pipe_w);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, -ret, "seccomp_export_bpf");
+
+  close_and_reset (&pipe_w);
+
+  ret = read_all_fd (pipe_r, "seccomp pipe", &bpf, &len, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = fcntl (pipe_r, F_GETPIPE_SZ);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "fcntl (F_GETPIPE_SZ)");
+  if (UNLIKELY (len >= (size_t) ret))
+    return crun_make_error (err, 0, "the seccomp filter does not fit in a pipe");
+#  endif
+
+  return safe_write (fd, "seccomp.bpf", bpf, len, err);
+}
+#endif /* HAVE_SECCOMP */
 
 static void
 make_lowercase (char *str)
@@ -225,6 +302,9 @@ libcrun_apply_seccomp (int infd, int listener_receiver_fd, const char *receiver_
       size_t i = 0;
       for (i = 0; i < seccomp_flags_len; i++)
         {
+          if (seccomp_flags[i] == NULL)
+            return crun_make_error (err, EINVAL, "seccomp flag is not specified");
+
           if (strcmp (seccomp_flags[i], "SECCOMP_FILTER_FLAG_TSYNC") == 0)
             flags |= SECCOMP_FILTER_FLAG_TSYNC;
           else if (strcmp (seccomp_flags[i], "SECCOMP_FILTER_FLAG_SPEC_ALLOW") == 0)
@@ -379,16 +459,40 @@ calculate_seccomp_checksum (runtime_spec_schema_config_linux_seccomp *seccomp, u
 
   blake3_hasher_init (&hasher);
 
-#define PROCESS_STRING(X)                                  \
-  do                                                       \
-    {                                                      \
-      if (X)                                               \
-        blake3_hasher_update (&hasher, (X), strlen ((X))); \
+  /* Every field is framed so that distinct configurations cannot hash to the
+     same value: strings carry a presence byte and an explicit length, arrays
+     carry their element count, and optional scalars carry a presence byte.
+     Everything that influences the generated filter MUST be included here,
+     otherwise a stale filter could be served from the cache.  */
+#define PROCESS_STRING(X)                                           \
+  do                                                                \
+    {                                                               \
+      const char *str_ = (X);                                       \
+      unsigned char present_ = str_ ? 1 : 0;                        \
+      size_t len_ = str_ ? strlen (str_) : 0;                       \
+      blake3_hasher_update (&hasher, &present_, sizeof (present_)); \
+      blake3_hasher_update (&hasher, &len_, sizeof (len_));         \
+      if (str_)                                                     \
+        blake3_hasher_update (&hasher, str_, len_);                 \
   } while (0)
 #define PROCESS_DATA(X)                                   \
   do                                                      \
     {                                                     \
       blake3_hasher_update (&hasher, &(X), sizeof ((X))); \
+  } while (0)
+#define PROCESS_OPTIONAL_DATA(PRESENT, X)                           \
+  do                                                                \
+    {                                                               \
+      unsigned char present_ = (PRESENT) ? 1 : 0;                   \
+      blake3_hasher_update (&hasher, &present_, sizeof (present_)); \
+      if (PRESENT)                                                  \
+        blake3_hasher_update (&hasher, &(X), sizeof ((X)));         \
+  } while (0)
+#define PROCESS_COUNT(X)                                        \
+  do                                                            \
+    {                                                           \
+      size_t count_ = (X);                                      \
+      blake3_hasher_update (&hasher, &count_, sizeof (count_)); \
   } while (0)
 
   PROCESS_STRING (PACKAGE_VERSION);
@@ -414,28 +518,40 @@ calculate_seccomp_checksum (runtime_spec_schema_config_linux_seccomp *seccomp, u
 
   PROCESS_DATA (seccomp_gen_options);
 
-  PROCESS_DATA (seccomp->default_errno_ret);
+  /* default_errno_ret is only honoured when present (absent defaults to EPERM).  */
+  PROCESS_OPTIONAL_DATA (seccomp->default_errno_ret_present, seccomp->default_errno_ret);
   PROCESS_STRING (seccomp->default_action);
+
+  PROCESS_COUNT (seccomp->flags_len);
   for (i = 0; i < seccomp->flags_len; i++)
     PROCESS_STRING (seccomp->flags[i]);
+
+  PROCESS_COUNT (seccomp->architectures_len);
   for (i = 0; i < seccomp->architectures_len; i++)
     PROCESS_STRING (seccomp->architectures[i]);
+
+  PROCESS_COUNT (seccomp->syscalls_len);
   for (i = 0; i < seccomp->syscalls_len; i++)
     {
       size_t j;
 
-      if (seccomp->syscalls[i]->action)
-        PROCESS_STRING (seccomp->syscalls[i]->action);
+      PROCESS_STRING (seccomp->syscalls[i]->action);
+
+      /* errno_ret is only honoured when present (absent defaults to EPERM).  */
+      PROCESS_OPTIONAL_DATA (seccomp->syscalls[i]->errno_ret_present, seccomp->syscalls[i]->errno_ret);
+
+      PROCESS_COUNT (seccomp->syscalls[i]->names_len);
       for (j = 0; j < seccomp->syscalls[i]->names_len; j++)
         PROCESS_STRING (seccomp->syscalls[i]->names[j]);
+
+      PROCESS_COUNT (seccomp->syscalls[i]->args_len);
       for (j = 0; j < seccomp->syscalls[i]->args_len; j++)
         {
-          if (seccomp->syscalls[i]->args[j]->index_present)
-            PROCESS_DATA (seccomp->syscalls[i]->args[j]->index);
-          if (seccomp->syscalls[i]->args[j]->value_present)
-            PROCESS_DATA (seccomp->syscalls[i]->args[j]->value);
-          if (seccomp->syscalls[i]->args[j]->value_two_present)
-            PROCESS_DATA (seccomp->syscalls[i]->args[j]->value_two);
+          /* index, value and value_two are used unconditionally by the
+             generator (absent fields are 0), so hash them in fixed positions.  */
+          PROCESS_DATA (seccomp->syscalls[i]->args[j]->index);
+          PROCESS_DATA (seccomp->syscalls[i]->args[j]->value);
+          PROCESS_DATA (seccomp->syscalls[i]->args[j]->value_two);
           PROCESS_STRING (seccomp->syscalls[i]->args[j]->op);
         }
     }
@@ -453,6 +569,8 @@ calculate_seccomp_checksum (runtime_spec_schema_config_linux_seccomp *seccomp, u
 
 #undef PROCESS_STRING
 #undef PROCESS_DATA
+#undef PROCESS_OPTIONAL_DATA
+#undef PROCESS_COUNT
   return 1;
 }
 
@@ -574,6 +692,29 @@ evict_cache (int root_dfd, libcrun_error_t *err)
   return 0;
 }
 
+/* Open the run-directory dirfd and build the "<id>/seccomp.bpf" path
+   relative to it.  Returns the (caller-owned) dirfd or a negative error.  */
+static int
+open_seccomp_bpf_dirfd (libcrun_container_t *container, char **rel_path, libcrun_error_t *err)
+{
+  int ret;
+  int dirfd;
+
+  dirfd = open_rundir_dirfd (container->context ? container->context->state_root : NULL, err);
+  if (UNLIKELY (dirfd < 0))
+    return dirfd;
+
+  /* relative path to dirfd.  */
+  ret = append_paths (rel_path, err, container->context->id, "seccomp.bpf", NULL);
+  if (UNLIKELY (ret < 0))
+    {
+      TEMP_FAILURE_RETRY (close (dirfd));
+      return ret;
+    }
+
+  return dirfd;
+}
+
 static int
 store_seccomp_cache (struct libcrun_seccomp_gen_ctx_s *ctx, libcrun_error_t *err)
 {
@@ -589,14 +730,9 @@ store_seccomp_cache (struct libcrun_seccomp_gen_ctx_s *ctx, libcrun_error_t *err
   if (is_empty_string (ctx->checksum))
     return 0;
 
-  dirfd = open_rundir_dirfd ((container->context ? container->context->state_root : NULL), err);
+  dirfd = open_seccomp_bpf_dirfd (container, &src_path, err);
   if (UNLIKELY (dirfd < 0))
     return dirfd;
-
-  /* relative path to dirfd.  */
-  ret = append_paths (&src_path, err, container->context->id, "seccomp.bpf", NULL);
-  if (UNLIKELY (ret < 0))
-    return ret;
 
   ret = append_paths (&dest_path, err, SECCOMP_CACHE_DIR, ctx->checksum, NULL);
   if (UNLIKELY (ret < 0))
@@ -624,6 +760,18 @@ get_seccomp_configuration (struct libcrun_seccomp_gen_ctx_s *ctx)
     return 0;
 
   return ctx->container->container_def->linux->seccomp;
+}
+
+/* Whether a seccomp.bpf file is expected to exist for the container.  */
+static inline bool
+has_seccomp_configuration (struct libcrun_seccomp_gen_ctx_s *ctx)
+{
+  if (ctx->container == NULL || ctx->container->container_def == NULL
+      || ctx->container->container_def->linux == NULL)
+    return false;
+
+  return ctx->container->container_def->linux->seccomp != NULL
+         || find_annotation (ctx->container, "run.oci.seccomp_bpf_data") != NULL;
 }
 
 static int
@@ -666,7 +814,8 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
   int ret;
   size_t i;
   cleanup_seccomp scmp_filter_ctx ctx = NULL;
-  int action, default_action, default_errno_value = EPERM;
+  int default_errno_value = EPERM;
+  uint32_t action, default_action;
   const char *def_action = NULL;
 
   /* The bpf filter was loaded from the cache, nothing to do here.  */
@@ -696,9 +845,9 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
       default_errno_value = seccomp->default_errno_ret;
     }
 
-  default_action = get_seccomp_action (def_action, default_errno_value, err);
-  if (UNLIKELY (err && *err != NULL))
-    return -1;
+  ret = get_seccomp_action (def_action, default_errno_value, &default_action, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   ctx = seccomp_init (default_action);
   if (ctx == NULL)
@@ -711,6 +860,9 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
       char *end, lowercase_arch[32] = {
         0,
       };
+
+      if (arch == NULL)
+        return crun_make_error (err, EINVAL, "seccomp architecture is not specified");
 
       if (has_prefix (arch, "SCMP_ARCH_"))
         arch += 10;
@@ -732,6 +884,7 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
   for (i = 0; i < seccomp->syscalls_len; i++)
     {
       size_t j;
+      bool multiple_args = false;
       int errno_ret = EPERM;
 
       if (seccomp->syscalls[i]->errno_ret_present)
@@ -741,12 +894,33 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
           errno_ret = seccomp->syscalls[i]->errno_ret;
         }
 
-      action = get_seccomp_action (seccomp->syscalls[i]->action, errno_ret, err);
-      if (UNLIKELY (err && *err != NULL))
-        return -1;
+      ret = get_seccomp_action (seccomp->syscalls[i]->action, errno_ret, &action, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
 
       if (action == default_action)
         continue;
+
+      /* The argument indices do not depend on the syscall name, so validate
+         them once per entry.  Doing it here also makes an invalid index an
+         error even when every name below is unknown and skipped.  */
+      if (seccomp->syscalls[i]->args != NULL)
+        {
+          uint32_t count[6] = {};
+          size_t k;
+
+          for (k = 0; k < seccomp->syscalls[i]->args_len; k++)
+            {
+              uint32_t index = seccomp->syscalls[i]->args[k]->index;
+
+              if (index >= 6)
+                return crun_make_error (err, 0, "invalid seccomp index `%u`", index);
+
+              count[index]++;
+              if (count[index] > 1)
+                multiple_args = true;
+            }
+        }
 
       for (j = 0; j < seccomp->syscalls[i]->names_len; j++)
         {
@@ -770,54 +944,59 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
           else
             {
               size_t k;
-              struct scmp_arg_cmp arg_cmp[6];
-              bool multiple_args = false;
-              uint32_t count[6] = {};
 
-              for (k = 0; k < seccomp->syscalls[i]->args_len && k < 6; k++)
-                {
-                  uint32_t index;
+              /* If multiple rules refer to the same argument, treat the rules are in OR.
 
-                  index = seccomp->syscalls[i]->args[k]->index;
-                  if (index >= 6)
-                    return crun_make_error (err, 0, "invalid seccomp index `%zu`", i);
-
-                  count[index]++;
-                  if (count[index] > 1)
-                    {
-                      multiple_args = true;
-                      break;
-                    }
-                }
-
-              for (k = 0; k < seccomp->syscalls[i]->args_len && k < 6; k++)
-                {
-                  char *op = seccomp->syscalls[i]->args[k]->op;
-
-                  arg_cmp[k].arg = seccomp->syscalls[i]->args[k]->index;
-                  arg_cmp[k].op = get_seccomp_operator (op, err);
-                  if (arg_cmp[k].op == 0)
-                    return crun_make_error (err, 0, "get_seccomp_operator");
-                  arg_cmp[k].datum_a = seccomp->syscalls[i]->args[k]->value;
-                  arg_cmp[k].datum_b = seccomp->syscalls[i]->args[k]->value_two;
-                }
-
-              if (! multiple_args)
-                {
-                  ret = seccomp_rule_add_array (ctx, action, syscall, k, arg_cmp);
-                  if (UNLIKELY (ret < 0))
-                    return crun_make_error (err, -ret, "seccomp_rule_add_array");
-                }
-              else
+                 Note this is not limited to the repeated argument: once any index
+                 is repeated, every condition of the entry becomes a rule of its
+                 own, so conditions on distinct indices stop being ANDed together.
+                 The OCI runtime specification does not define how conditions
+                 combine, and this matches what runc does; see
+                 https://github.com/opencontainers/runc/issues/2735.  */
+              if (multiple_args)
                 {
                   size_t r;
 
-                  for (r = 0; r < k; r++)
+                  for (r = 0; r < seccomp->syscalls[i]->args_len; r++)
                     {
-                      ret = seccomp_rule_add_array (ctx, action, syscall, 1, &arg_cmp[r]);
+                      struct scmp_arg_cmp arg_cmp;
+                      char *op = seccomp->syscalls[i]->args[r]->op;
+
+                      arg_cmp.arg = seccomp->syscalls[i]->args[r]->index;
+                      ret = get_seccomp_operator (op, &arg_cmp.op, err);
+                      if (UNLIKELY (ret < 0))
+                        return ret;
+                      arg_cmp.datum_a = seccomp->syscalls[i]->args[r]->value;
+                      arg_cmp.datum_b = seccomp->syscalls[i]->args[r]->value_two;
+
+                      ret = seccomp_rule_add_array (ctx, action, syscall, 1, &arg_cmp);
                       if (UNLIKELY (ret < 0))
                         return crun_make_error (err, -ret, "seccomp_rule_add_array");
                     }
+                }
+              else
+                {
+                  /* No index is repeated, so there are at most 6 distinct arguments.  */
+                  const size_t args_len = seccomp->syscalls[i]->args_len;
+                  struct scmp_arg_cmp arg_cmp[6];
+
+                  for (k = 0; k < args_len; k++)
+                    {
+                      char *op = seccomp->syscalls[i]->args[k]->op;
+
+                      arg_cmp[k].arg = seccomp->syscalls[i]->args[k]->index;
+                      ret = get_seccomp_operator (op, &(arg_cmp[k].op), err);
+                      if (UNLIKELY (ret < 0))
+                        return ret;
+                      arg_cmp[k].datum_a = seccomp->syscalls[i]->args[k]->value;
+                      arg_cmp[k].datum_b = seccomp->syscalls[i]->args[k]->value_two;
+                    }
+
+                  /* An empty "args" array means the rule is unconditional.  Do not
+                     hand over the uninitialized buffer for it.  */
+                  ret = seccomp_rule_add_array (ctx, action, syscall, args_len, args_len ? arg_cmp : NULL);
+                  if (UNLIKELY (ret < 0))
+                    return crun_make_error (err, -ret, "seccomp_rule_add_array");
                 }
             }
         }
@@ -825,9 +1004,9 @@ libcrun_generate_seccomp (struct libcrun_seccomp_gen_ctx_s *gen_ctx, libcrun_err
 
   if (gen_ctx->fd >= 0)
     {
-      ret = seccomp_export_bpf (ctx, gen_ctx->fd);
+      ret = export_bpf (ctx, gen_ctx->fd, err);
       if (UNLIKELY (ret < 0))
-        return crun_make_error (err, -ret, "seccomp_export_bpf");
+        return ret;
 
       return store_seccomp_cache (gen_ctx, err);
     }
@@ -874,14 +1053,9 @@ libcrun_open_seccomp_bpf (struct libcrun_seccomp_gen_ctx_s *ctx, int *fd, libcru
   if (container == NULL || container->context == NULL)
     return crun_make_error (err, EINVAL, "invalid internal state");
 
-  dirfd = open_rundir_dirfd ((container->context ? container->context->state_root : NULL), err);
+  dirfd = open_seccomp_bpf_dirfd (container, &dest_path, err);
   if (UNLIKELY (dirfd < 0))
     return dirfd;
-
-  /* relative path to dirfd.  */
-  ret = append_paths (&dest_path, err, container->context->id, "seccomp.bpf", NULL);
-  if (UNLIKELY (ret < 0))
-    return ret;
 
   if (ctx->create)
     {
@@ -908,7 +1082,9 @@ libcrun_open_seccomp_bpf (struct libcrun_seccomp_gen_ctx_s *ctx, int *fd, libcru
       ret = TEMP_FAILURE_RETRY (openat (dirfd, dest_path, O_CLOEXEC | O_RDONLY));
       if (UNLIKELY (ret < 0))
         {
-          if (errno == ENOENT)
+          /* The file is missing only when the container has no seccomp
+             configuration.  If it is configured, do not run without the filter.  */
+          if (errno == ENOENT && ! has_seccomp_configuration (ctx))
             return 0;
           return crun_make_error (err, errno, "open `seccomp.bpf`");
         }

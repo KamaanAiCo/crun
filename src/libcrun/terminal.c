@@ -30,6 +30,10 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 
+#ifndef TIOCGPTPEER
+#  define TIOCGPTPEER _IO ('T', 0x41)
+#endif
+
 struct terminal_status_s
 {
   int fd;
@@ -69,7 +73,12 @@ libcrun_set_raw (int fd, void **current_status, libcrun_error_t *err)
 
   ret = tcgetattr (fd, &termios);
   if (UNLIKELY (ret < 0))
-    return crun_make_error (err, errno, "tcgetattr");
+    {
+      /* Nothing to do if FD is not a terminal.  */
+      if (errno == ENOTTY)
+        return 0;
+      return crun_make_error (err, errno, "tcgetattr");
+    }
 
   if (current_status)
     {
@@ -80,9 +89,28 @@ libcrun_set_raw (int fd, void **current_status, libcrun_error_t *err)
     }
 
   cfmakeraw (&termios);
+  termios.c_iflag = 0;
 
-  termios.c_iflag &= OPOST;
-  termios.c_oflag &= OPOST;
+  ret = tcsetattr (fd, TCSANOW, &termios);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "tcsetattr");
+
+  return 0;
+}
+
+/* Do not translate "\n" to "\r\n" on output, so that what the container
+   writes to the terminal reaches our stdout unchanged.  */
+int
+libcrun_clear_onlcr (int fd, libcrun_error_t *err)
+{
+  int ret;
+  struct termios termios;
+
+  ret = tcgetattr (fd, &termios);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "tcgetattr");
+
+  termios.c_oflag &= ~ONLCR;
 
   ret = tcsetattr (fd, TCSANOW, &termios);
   if (UNLIKELY (ret < 0))
@@ -92,11 +120,19 @@ libcrun_set_raw (int fd, void **current_status, libcrun_error_t *err)
 }
 
 int
-libcrun_set_stdio (char *pty, libcrun_error_t *err)
+libcrun_set_stdio (int ptmx_fd, char *pty, libcrun_error_t *err)
 {
+  cleanup_close int fd = -1;
   int ret, i;
-  cleanup_close int fd = open (pty, O_RDWR | O_CLOEXEC);
 
+  /* Open the slave directly from the master.  The path is resolved in the
+     container mount namespace, and could point anywhere.  */
+  fd = ioctl (ptmx_fd, TIOCGPTPEER, O_RDWR | O_CLOEXEC);
+  if (fd < 0 && (errno == EINVAL || errno == ENOTTY))
+    {
+      /* TIOCGPTPEER requires Linux 4.13.  */
+      fd = open (pty, O_RDWR | O_CLOEXEC);
+    }
   if (UNLIKELY (fd < 0))
     return crun_make_error (err, errno, "open `%s`", pty);
 

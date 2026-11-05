@@ -1,11 +1,7 @@
 name: "CodeQL"
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    # The branches below must be a subset of the branches above
-    branches: [ main ]
+  workflow_call:
   schedule:
     - cron: '39 22 * * 5'
 
@@ -25,20 +21,24 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v4
+      uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
       with:
         languages: ${{ matrix.language }}
 
     - run: |
        sudo apt-get update
-       sudo apt-get install -y make git gcc build-essential pkgconf libtool libsystemd-dev libcap-dev libseccomp-dev libyajl-dev go-md2man libtool autoconf python3 automake libprotobuf-c-dev
+       sudo apt-get install -y make git gcc build-essential pkgconf libtool libsystemd-dev libcap-dev libseccomp-dev go-md2man libtool autoconf python3 automake libprotobuf-c-dev libjson-c-dev
        ./autogen.sh
-       ./configure
-       make -j $(nproc)
+       ./configure --enable-embedded-blake3
+       make -j "$(nproc)"
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v4
+      uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+      with:
+        category: .github/workflows/codeql-analysis.yml:analyze/language:${{ matrix.language }}

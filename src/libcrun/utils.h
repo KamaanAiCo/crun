@@ -21,6 +21,7 @@
 #include <config.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include <argp.h>
 #include "error.h"
@@ -233,13 +234,13 @@ xstrdup (const char *str)
 
 void consume_trailing_slashes (char *path);
 
-static inline const char *
-consume_slashes (const char *t)
-{
-  while (*t == '/')
-    t++;
-  return t;
-}
+#define consume_slashes(t) \
+  ({                       \
+    typeof (t) _s = (t);   \
+    while (*_s == '/')     \
+      _s++;                \
+    _s;                    \
+  })
 
 static inline bool
 path_is_slash_dev (const char *path)
@@ -271,12 +272,6 @@ write_file (const char *name, const void *data, size_t len, libcrun_error_t *err
   return write_file_at_with_flags (AT_FDCWD, WRITE_FILE_DEFAULT_FLAGS, 0700, name, data, len, err);
 }
 
-static inline int
-write_file_at (int dirfd, const char *name, const void *data, size_t len, libcrun_error_t *err)
-{
-  return write_file_at_with_flags (dirfd, WRITE_FILE_DEFAULT_FLAGS, 0700, name, data, len, err);
-}
-
 int crun_ensure_directory (const char *path, int mode, bool nofollow, libcrun_error_t *err);
 
 int crun_ensure_directory_at (int dirfd, const char *path, int mode, bool nofollow, libcrun_error_t *err);
@@ -306,6 +301,8 @@ int add_selinux_mount_label (char **ret, const char *data, const char *label, co
 int set_apparmor_profile (libcrun_container_t *container, const char *profile, bool no_new_privileges, bool now, libcrun_error_t *err);
 
 int read_all_fd_with_size_hint (int fd, const char *description, char **out, size_t *len, size_t hint, libcrun_error_t *err);
+
+int read_all_fd_with_max_size (int fd, const char *description, char **out, size_t *len, size_t max_size, libcrun_error_t *err);
 
 static inline int
 read_all_fd (int fd, const char *description, char **out, size_t *len, libcrun_error_t *err)
@@ -352,13 +349,34 @@ void get_current_timestamp (char *out, size_t len);
 
 int set_blocking_fd (int fd, bool blocking, libcrun_error_t *err);
 
-int parse_json_file (yajl_val *out, const char *jsondata, struct parser_context *ctx, libcrun_error_t *err);
+/* Exported for the language bindings (python/, lua/), which parse a
+   process JSON blob before calling libcrun_container_exec.  */
+LIBCRUN_PUBLIC int parse_json_file (json_object **out, const char *jsondata, struct parser_context *ctx, libcrun_error_t *err);
 
+/* Check that the string STR has the prefix PREFIX.  */
 static inline int
 has_prefix (const char *str, const char *prefix)
 {
-  size_t prefix_len = strlen (prefix);
+  size_t prefix_len;
+
+  if (! str || ! prefix)
+    return 0;
+
+  prefix_len = strlen (prefix);
   return strlen (str) >= prefix_len && memcmp (str, prefix, prefix_len) == 0;
+}
+
+/* Check that the string STR has the prefix PREFIX/ (followed by a slash).  */
+static inline int
+has_dir_prefix (const char *str, const char *prefix)
+{
+  size_t prefix_len;
+
+  if (! str || ! prefix)
+    return 0;
+
+  prefix_len = strlen (prefix);
+  return strlen (str) > prefix_len && memcmp (str, prefix, prefix_len) == 0 && str[prefix_len] == '/';
 }
 
 int find_executable (char **exec_path, const char *executable_path, const char *cwd, libcrun_error_t *err);
@@ -377,6 +395,8 @@ int get_file_type_at (int dirfd, mode_t *mode, bool nofollow, const char *path);
 
 int get_file_type (mode_t *mode, bool nofollow, const char *path);
 
+uint64_t get_mount_id (const char *path);
+
 int get_file_type_fd (int fd, mode_t *mode);
 
 char *get_user_name (uid_t uid);
@@ -392,6 +412,7 @@ int str2sig (const char *name);
 
 int base64_decode (const char *iptr, size_t isize, char *optr, size_t osize, size_t *nbytes);
 int has_suffix (const char *source, const char *suffix);
+char *libcrun_sysctl_key_to_proc_path (const char *key);
 char *str_join_array (int offset, size_t size, char *const array[], const char *joint);
 
 ssize_t safe_readlinkat (int dfd, const char *name, char **buffer, ssize_t hint, libcrun_error_t *err);
@@ -404,16 +425,52 @@ is_empty_string (const char *s)
   return s == NULL || s[0] == '\0';
 }
 
+/* Like strlen(), but a NULL string has length 0.  */
+static inline size_t
+safe_strlen (const char *s)
+{
+  return s == NULL ? 0 : strlen (s);
+}
+
+static inline bool
+path_has_dot_dot_component (const char *path)
+{
+  if (path == NULL)
+    return false;
+  cleanup_free char *npath = xstrdup (path);
+  char *cur, *it;
+
+  cur = npath;
+  it = strchr (cur, '/');
+  while (cur)
+    {
+      if (it)
+        *it = '\0';
+
+      if (strcmp (cur, "..") == 0)
+        return true;
+
+      if (it == NULL)
+        break;
+
+      cur = consume_slashes (it + 1);
+      *it = '/';
+      it = strchr (cur, '/');
+    }
+  return false;
+}
+
 static inline int
 waitpid_ignore_stopped (pid_t pid, int *status, int options)
 {
-  int ret, s = 0;
+  int ret, s;
   do
     {
+      s = 0;
       ret = TEMP_FAILURE_RETRY (waitpid (pid, &s, options));
       if (ret < 0)
         return ret;
-  } while (WIFSTOPPED (s) | WIFCONTINUED (s));
+  } while (WIFSTOPPED (s) || WIFCONTINUED (s));
 
   if (status)
     *status = s;
@@ -474,6 +531,12 @@ get_proc_self_fd_path (proc_fd_path_t path, int fd)
   get_proc_fd_path (path, 0, fd);
 }
 
+static inline void
+get_self_fd_path (proc_fd_path_t path, int fd)
+{
+  snprintf (path, sizeof (proc_fd_path_t), "self/fd/%d", fd);
+}
+
 static inline int
 validate_options (unsigned int specified_options, unsigned int supported_options, libcrun_error_t *err)
 {
@@ -505,6 +568,13 @@ void channel_fd_pair_free (struct channel_fd_pair *channel);
  * and unregistered as necessary.
  */
 int channel_fd_pair_process (struct channel_fd_pair *channel, int epollfd, libcrun_error_t *err);
+
+/* Copy the data buffered in the channel_fd_pair, and the data currently
+ * available from the input file descriptor, to the output file descriptor.
+ * It is meant to be used once the writer to the input is gone, with the
+ * output file descriptor in blocking mode.
+ */
+int channel_fd_pair_flush (struct channel_fd_pair *channel, libcrun_error_t *err);
 
 static inline void
 cleanup_channel_fd_pairp (void *p)

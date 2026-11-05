@@ -26,8 +26,6 @@
 
 #include "crun.h"
 #include "run_create.h"
-#include "libcrun/container.h"
-#include "libcrun/utils.h"
 
 int
 crun_run_create_internal (struct crun_global_arguments *global_args, int argc, char **argv,
@@ -39,9 +37,8 @@ crun_run_create_internal (struct crun_global_arguments *global_args, int argc, c
   cleanup_container libcrun_container_t *container = NULL;
   cleanup_free char *bundle_cleanup = NULL;
   cleanup_free char *config_file_cleanup = NULL;
-
-  crun_context->preserve_fds = 0;
-  crun_context->listen_fds = 0;
+  cleanup_free char *pid_file_cleanup = NULL;
+  const char *pid_file;
 
   argp_parse (run_argp, argc, argv, ARGP_IN_ORDER, &first_arg, crun_context);
   /* Get options after parsing the arguments.  */
@@ -61,6 +58,20 @@ crun_run_create_internal (struct crun_global_arguments *global_args, int argc, c
             libcrun_fail_with_error (errno, "realpath `%s` failed", config_file);
           config_file = config_file_cleanup;
         }
+    }
+
+  /* Make sure the pid file is an absolute path before changing the directory.  */
+  pid_file = libcrun_context_get_pid_file (crun_context);
+  if (pid_file && pid_file[0] != '/')
+    {
+      cleanup_free char *cwd = getcwd (NULL, 0);
+      if (UNLIKELY (cwd == NULL))
+        libcrun_fail_with_error (errno, "getcwd failed");
+      size_t len = strlen (cwd) + strlen (pid_file) + 2;
+
+      pid_file_cleanup = xmalloc0 (len);
+      snprintf (pid_file_cleanup, len, "%s/%s", cwd, pid_file);
+      libcrun_context_set_pid_file (crun_context, pid_file_cleanup);
     }
 
   /* Make sure the bundle is an absolute path.  */
@@ -84,20 +95,30 @@ crun_run_create_internal (struct crun_global_arguments *global_args, int argc, c
         libcrun_fail_with_error (errno, "chdir `%s` failed", bundle);
     }
 
-  ret = init_libcrun_context (crun_context, argv[first_arg], global_args, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
+  int listen_fds = get_listen_fds ();
+  if (listen_fds > 0)
+    {
+      libcrun_context_set_listen_fds (crun_context, listen_fds);
+      libcrun_context_set_preserve_fds (crun_context, libcrun_context_get_preserve_fds (crun_context) + listen_fds);
+    }
 
+  /* The config file may be passed as /dev/fd/N, so read it before
+     closing the file descriptors.  */
   container = libcrun_container_load_from_file (config_file, err);
   if (container == NULL)
     return -1;
 
+  /* Close the file descriptors inherited from the caller, so they do
+     not leak into the container.  */
+  ret = libcrun_close_inherited_fds (crun_context, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = init_libcrun_context (crun_context, argv[first_arg], global_args, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
   libcrun_debug ("Using bundle: %s", bundle);
-  crun_context->bundle = bundle;
-  if (getenv ("LISTEN_FDS"))
-    {
-      crun_context->listen_fds = parse_int_or_fail (getenv ("LISTEN_FDS"), "LISTEN_FDS");
-      crun_context->preserve_fds += crun_context->listen_fds;
-    }
+  libcrun_context_set_bundle (crun_context, bundle);
   return container_run_create_func (crun_context, container, options, err);
 }

@@ -16,6 +16,8 @@
 # along with crun.  If not, see <http://www.gnu.org/licenses/>.
 
 import json
+import resource
+import errno
 import os
 import subprocess
 import time
@@ -1006,6 +1008,105 @@ def test_cgroup_exec_into_running():
             run_crun_command(["delete", "-f", cid])
 
 
+def test_cgroup_v1_exec_cgroup_subpath():
+    """Test cgroup v1 exec sub-cgroup movement stays below the container cgroup."""
+    if is_cgroup_v2_unified():
+        return (77, "requires cgroup v1")
+    if is_rootless():
+        return (77, "requires root for cgroup v1 manipulation")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    parent = 'test-v1-exec-cgroup-%s' % os.getpid()
+    conf['linux']['cgroupsPath'] = '/%s/container' % parent
+    conf['process']['args'] = ['/init', 'pause']
+
+    cid = None
+    created_paths = []
+    target_subsystem = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+
+        for subsystem in ['memory', 'pids', 'cpu,cpuacct', 'cpu', 'freezer']:
+            container_dir = os.path.join('/sys/fs/cgroup', subsystem, parent, 'container')
+            if os.path.isdir(container_dir):
+                target_subsystem = subsystem
+                break
+
+        if target_subsystem is None:
+            return (77, "no writable cgroup v1 subsystem found")
+
+        container_dir = os.path.join('/sys/fs/cgroup', target_subsystem, parent, 'container')
+        outside_dir = os.path.join('/sys/fs/cgroup', target_subsystem, parent, 'outside')
+        for path in [
+            os.path.join(container_dir, 'foo'),
+            os.path.join(container_dir, 'foo', 'bar'),
+            outside_dir,
+        ]:
+            try:
+                os.mkdir(path, 0o700)
+                created_paths.append(path)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                if e.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                    return (77, "cgroup v1 subsystem is not writable")
+                raise
+
+        out = run_crun_command(['exec', '--cgroup=foo', cid, '/init', 'cat', '/proc/self/cgroup'])
+        if '/foo' not in out:
+            logger.info("/foo not found in cgroup v1 exec output: %s", out)
+            return -1
+
+        invalid_cgroups = [
+            ('../outside', '`..` components are not allowed'),
+            ('./../outside', '`..` components are not allowed'),
+            ('./foo/../foo', '`..` components are not allowed'),
+            ('foo/..', '`..` components are not allowed'),
+            ('foo/../../outside', '`..` components are not allowed'),
+            ('foo/bar/..', '`..` components are not allowed'),
+            ('foo/bar/../../../outside', '`..` components are not allowed'),
+        ]
+        for sub_cgroup, expected_error in invalid_cgroups:
+            try:
+                run_crun_command_raw(['exec', '--cgroup=%s' % sub_cgroup, cid, '/init', 'true'])
+            except subprocess.CalledProcessError as e:
+                output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+                if expected_error in output and sub_cgroup in output:
+                    continue
+                logger.info("unexpected error for invalid v1 exec cgroup %s: %s", sub_cgroup, output)
+                return -1
+            logger.info("v1 exec accepted invalid cgroup path %s", sub_cgroup)
+            return -1
+
+        return 0
+
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        if "cgroup" in output.lower() or "mount" in output.lower() or "proc" in output.lower():
+            return (77, "cgroup v1 exec not available")
+        logger.info("test failed: %s", e)
+        return -1
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+        for path in reversed(created_paths):
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+        if target_subsystem is not None:
+            try:
+                os.rmdir(os.path.join('/sys/fs/cgroup', target_subsystem, parent))
+            except OSError:
+                pass
+
+
 def test_cgroup_cpuset_multiple_cpus():
     """Test cpuset with multiple CPUs and memory nodes."""
     if is_rootless():
@@ -1298,6 +1399,41 @@ def test_annotation_delegate_cgroup():
             run_crun_command(["delete", "-f", cid])
 
 
+def test_annotation_delegate_cgroup_dotdot():
+    """Test that run.oci.delegate-cgroup rejects '..' components."""
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if not running_on_systemd():
+        return (77, "requires systemd")
+    if get_cgroup_manager() != 'systemd':
+        return (77, "requires systemd cgroup manager")
+
+    conf = base_config()
+    add_all_namespaces(conf, cgroupns=True)
+    conf['process']['args'] = ['/init', 'echo', 'hello']
+
+    if 'annotations' not in conf:
+        conf['annotations'] = {}
+    conf['annotations']['run.oci.systemd.subgroup'] = 'mysubgroup'
+
+    for invalid in ["..", "../../../victim", "../escape", "a/../b"]:
+        conf['annotations']['run.oci.delegate-cgroup'] = invalid
+        try:
+            # Do not hide stderr: the error message crun prints there is
+            # exactly what this test needs to look at.
+            out, _ = run_and_get_output(conf)
+            return -1
+        except Exception as e:
+            if hasattr(e, 'output') and e.output:
+                err = e.output.decode()
+                if "delegate-cgroup" in err:
+                    continue
+                logger.info("got error for delegate-cgroup '%s': %s", invalid, err)
+            else:
+                logger.info("got exception without output for delegate-cgroup '%s': %s", invalid, str(e))
+            return -1
+    return 0
+
 def test_annotation_systemd_force_cgroup_v1():
     """Test run.oci.systemd.force_cgroup_v1 annotation."""
     if not is_cgroup_v2_unified():
@@ -1440,6 +1576,259 @@ def test_cgroup_disabled_detach():
     return _run_cgroup_disabled(detach=True)
 
 
+def test_cgroup_subcgroup_cleanup():
+    """Test that subcgroups are cleaned up on container delete.
+
+    Regression test for a bug where read_pids_cgroup() consumed the
+    caller's fd via fdopendir(), causing rmdir_all_fd() to fail with
+    EBADF when cleaning up nested cgroup directories.
+    """
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if is_rootless():
+        return (77, "requires root for cgroup manipulation")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    add_all_namespaces(conf, cgroupns=True)
+    conf['process']['args'] = ['/init', 'create-sub-cgroup-and-wait',
+                               'sub1', 'sub1/nested', 'sub2']
+
+    cgroup_path = f'/test-subcgroup-cleanup-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=False, command='run', detach=True)
+
+        # Verify the cgroup directory exists
+        if not os.path.isdir(host_cgroup_dir):
+            logger.info("cgroup directory %s does not exist", host_cgroup_dir)
+            return -1
+
+        # Delete the container -- crun must clean up all subcgroups
+        run_crun_command(['delete', '-f', cid])
+        cid = None
+
+        # Give a moment for cleanup
+        time.sleep(0.5)
+
+        # Verify cgroup directory is fully removed
+        if os.path.exists(host_cgroup_dir):
+            logger.info("cgroup directory %s still exists after delete", host_cgroup_dir)
+            return -1
+
+        return 0
+
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        if "Bad file descriptor" in output:
+            logger.info("EBADF during cgroup cleanup (known regression): %s", output)
+            return -1
+        if any(kw in output.lower() for kw in ["mount", "proc", "rootfs"]):
+            return (77, "environment issue")
+        logger.info("test failed: %s", e)
+        return -1
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+
+
+def test_cgroup_exec_frozen_subcgroup():
+    """Test that exec refuses to join a frozen sub-cgroup of the container
+    instead of waiting forever for a process that never runs."""
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if is_rootless():
+        return (77, "requires root for cgroup manipulation")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    add_all_namespaces(conf, cgroupns=True)
+    conf['process']['args'] = ['/init', 'pause']
+
+    cgroup_path = f'/test-exec-frozen-subcgroup-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    def write_cgroup_file(name, value):
+        with open(os.path.join(host_cgroup_dir, name), 'w') as f:
+            f.write(value)
+
+    def run_exec(args):
+        cmd = [get_crun_path(), '--root', get_tests_root_status(), 'exec', '-d'] + args + [cid, '/init', 'true']
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=False, command='run', detach=True)
+
+        state = json.loads(run_crun_command(['state', cid]))
+
+        # Once controllers are enabled the container cgroup cannot be joined
+        # anymore, and exec follows the init process into its sub-cgroup.
+        os.makedirs(os.path.join(host_cgroup_dir, 'a/b'))
+        write_cgroup_file('a/b/cgroup.procs', str(state['pid']))
+        try:
+            write_cgroup_file('cgroup.subtree_control', '+pids')
+        except OSError:
+            return (77, "cannot enable the pids controller")
+
+        all_args = ([], ['--cgroup', '/a/b'])
+
+        for args in all_args:
+            ret = run_exec(args)
+            if ret.returncode != 0:
+                logger.info("exec %s failed: %s", args, ret.stdout)
+                return -1
+
+        write_cgroup_file('a/b/cgroup.freeze', '1')
+
+        for args in all_args:
+            ret = run_exec(args)
+            if ret.returncode == 0 or b'frozen' not in ret.stdout:
+                logger.info("exec %s into a frozen cgroup returned %d: %s", args, ret.returncode, ret.stdout)
+                return -1
+
+        return 0
+
+    except subprocess.TimeoutExpired:
+        logger.info("exec into a frozen cgroup did not terminate")
+        return -1
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+
+
+def test_cgroup_cleanup_failed_start():
+    """Test that the cgroup is not left behind when the container creation
+    fails after the cgroup is created but before it is configured, and that
+    a pre-existing cgroup is left alone."""
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if is_rootless():
+        return (77, "requires root for cgroup manipulation")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    add_all_namespaces(conf, netns=False)
+    conf['process']['args'] = ['/init', 'true']
+    # Joining a namespace that does not exist fails before the container
+    # process is created.
+    conf['linux']['namespaces'].append({
+        'type': 'network',
+        'path': os.path.join(get_tests_root(), 'not-existing-netns'),
+    })
+
+    cgroup_path = f'/test-cleanup-failed-start-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    try:
+        for pre_existing in (False, True):
+            if pre_existing:
+                os.mkdir(host_cgroup_dir)
+
+            try:
+                run_and_get_output(conf, hide_stderr=True)
+                logger.info("the container was expected to fail")
+                return -1
+            except subprocess.CalledProcessError:
+                pass
+
+            if os.path.exists(host_cgroup_dir) != pre_existing:
+                logger.info("cgroup directory %s: pre-existing=%s, exists after the failed start=%s",
+                            host_cgroup_dir, pre_existing, not pre_existing)
+                return -1
+
+        return 0
+    finally:
+        try:
+            os.rmdir(host_cgroup_dir)
+        except OSError:
+            pass
+
+
+def test_cgroup_deep_subcgroup_cleanup():
+    """Test that a deep chain of subcgroups is walked and cleaned up on
+    container delete.
+
+    Regression test for a bug where the cgroup tree was walked recursively,
+    keeping open file descriptors for each level, so that a chain of
+    subcgroups deeper than the file descriptors limit made `crun ps` fail
+    and `crun delete` leave the cgroups behind.
+    """
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if is_rootless():
+        return (77, "requires root for cgroup manipulation")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    depth = 300
+
+    conf = base_config()
+    add_all_namespaces(conf, cgroupns=True)
+    conf['process']['args'] = ['/init', 'pause']
+
+    cgroup_path = f'/test-deep-subcgroup-cleanup-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=False, command='run', detach=True)
+
+        for i in range(1, depth + 1):
+            os.mkdir(host_cgroup_dir + '/c' * i)
+
+        # crun inherits the limit, a recursive walk needs more than depth descriptors
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(depth // 2, nofile[1]), nofile[1]))
+
+        processes = json.loads(run_crun_command(['ps', '--format', 'json', cid]))
+        if len(processes) != 1:
+            logger.info("expected 1 process, got %s", processes)
+            return -1
+
+        run_crun_command(['delete', '-f', cid])
+        cid = None
+
+        if os.path.exists(host_cgroup_dir):
+            logger.info("cgroup directory %s still exists after delete", host_cgroup_dir)
+            return -1
+
+        return 0
+
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, nofile)
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+        for i in range(depth, -1, -1):
+            try:
+                os.rmdir(host_cgroup_dir + '/c' * i)
+            except OSError:
+                pass
+
+
 all_tests = {
     "cgroup-disabled": test_cgroup_disabled,
     "cgroup-disabled-detach": test_cgroup_disabled_detach,
@@ -1475,13 +1864,19 @@ all_tests = {
     "cgroup-cpuset-multiple-cpus": test_cgroup_cpuset_multiple_cpus,
     "cgroup-enter-subsystem-memory": test_cgroup_enter_subsystem_memory,
     "cgroup-v1-subsystems": test_cgroup_v1_subsystems,
+    "cgroup-v1-exec-cgroup-subpath": test_cgroup_v1_exec_cgroup_subpath,
     "cgroup-deep-nested-path": test_cgroup_deep_nested_path,
     "cgroup-exec-multiple-times": test_cgroup_exec_multiple_times,
     "cgroup-create-without-resources": test_cgroup_create_without_resources,
     "annotation-systemd-subgroup": test_annotation_systemd_subgroup,
     "annotation-delegate-cgroup": test_annotation_delegate_cgroup,
+    "annotation-delegate-cgroup-dotdot": test_annotation_delegate_cgroup_dotdot,
     "annotation-systemd-force-cgroup-v1": test_annotation_systemd_force_cgroup_v1,
     "cgroup-v2-mount-options": test_cgroup_v2_mount_options,
+    "cgroup-subcgroup-cleanup": test_cgroup_subcgroup_cleanup,
+    "cgroup-deep-subcgroup-cleanup": test_cgroup_deep_subcgroup_cleanup,
+    "cgroup-exec-frozen-subcgroup": test_cgroup_exec_frozen_subcgroup,
+    "cgroup-cleanup-failed-start": test_cgroup_cleanup_failed_start,
 }
 
 if __name__ == "__main__":

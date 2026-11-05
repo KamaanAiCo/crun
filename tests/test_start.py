@@ -188,12 +188,9 @@ def test_start():
     cid = None
     try:
         proc, cid = run_and_get_output(conf, hide_stderr=True, command='create', use_popen=True)
-        for i in range(50):
-            try:
-                s = run_crun_command(["state", cid])
-                break
-            except Exception as e:
-                time.sleep(0.1)
+        if wait_for_state(cid, 'created') is None:
+            logger.info("container %s was not created", cid)
+            return -1
 
         run_crun_command(["start", cid])
         out, _ = proc.communicate()
@@ -220,12 +217,9 @@ def test_start_override_config():
     cid = None
     try:
         proc, cid = run_and_get_output(conf, hide_stderr=True, command='create', use_popen=True, relative_config_path="config/config.json")
-        for i in range(50):
-            try:
-                s = run_crun_command(["state", cid])
-                break
-            except Exception as e:
-                time.sleep(0.1)
+        if wait_for_state(cid, 'created') is None:
+            logger.info("container %s was not created", cid)
+            return -1
 
         run_crun_command(["start", cid])
         out, _ = proc.communicate()
@@ -263,6 +257,10 @@ def test_sd_notify():
         out, cid = run_and_get_output(conf, hide_stderr=True, env=env, command='run')
         if "/run/notify/the-socket" not in str(out):
             return -1
+        # the notify mount must not be a peer of the host mount it was cloned from
+        for line in str(out).splitlines():
+            if "/run/notify/the-socket" in line and "shared:" in line:
+                return -1
     except:
         return -1
     return 0
@@ -418,20 +416,70 @@ def test_run_rootless_netns_with_userns():
             run_crun_command(["delete", "-f", cid])
     return -1
 
-# Following test is for a special case where crun sets LISTEN_PID=1 when nothing is specified
-# to make sure that primary process is 1, this feature makes sure crun is in parity with runc.
+# Run crun with LISTEN_FDS set, and LISTEN_PID set to crun's own pid (if
+# listen_pid is None), or to listen_pid (unless it is an empty string).
+def run_with_listen_fds(conf, listen_fds, listen_pid=None):
+    wrapper = os.path.join(get_tests_root(), "listen-fds-wrapper")
+    if listen_pid is None:
+        listen_pid = "$$"
+    pid_env = "LISTEN_PID=%s" % listen_pid if listen_pid != "" else ""
+    with open(wrapper, "w") as f:
+        f.write('#!/bin/sh\nunset LISTEN_PID\n%s LISTEN_FDS=%s exec %s "$@"\n' %
+                (pid_env, listen_fds, os.path.abspath(get_crun_path())))
+    os.chmod(wrapper, 0o755)
+    old_runtime = os.environ.get("OCI_RUNTIME")
+    os.environ["OCI_RUNTIME"] = wrapper
+    try:
+        return run_and_get_output(conf, hide_stderr=True, command='run')
+    finally:
+        if old_runtime is None:
+            del os.environ["OCI_RUNTIME"]
+        else:
+            os.environ["OCI_RUNTIME"] = old_runtime
+
+# crun sets LISTEN_PID=1 in the container when it gets fds via LISTEN_FDS
+# (and the container config does not set LISTEN_PID), same as runc.
 def test_listen_pid_env():
     conf = base_config()
     conf['process']['args'] = ['/init', 'printenv', 'LISTEN_PID']
     add_all_namespaces(conf)
-    env = dict(os.environ)
-    env["LISTEN_FDS"] = "1"
     try:
-        out, cid = run_and_get_output(conf, hide_stderr=True, env=env, command='run')
-        if "1" not in str(out):
+        out, _ = run_with_listen_fds(conf, 1)
+        if out.strip() != "1":
+            logger.info("unexpected LISTEN_PID in the container: %s", out)
             return -1
-    except:
+    except Exception as e:
+        logger.info("run failed: %s", e)
         return -1
+    return 0
+
+# Return the fds above stdio the container gets with LISTEN_FDS=100.
+def listen_fds_in_container(listen_pid):
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'ls', '/proc/1/fd']
+    add_all_namespaces(conf)
+    with open('/dev/null', 'r') as f1, open('/dev/null', 'r') as f2, open('/dev/null', 'r') as f3:
+        for i in range(100):
+            try:
+                os.set_inheritable(i, True)
+            except:
+                pass
+        out, _ = run_with_listen_fds(conf, 100, listen_pid)
+    return [x for x in out.split('\n') if len(x) > 0 and x[0] != '.' and int(x) > 2]
+
+def test_listen_fds():
+    if len(listen_fds_in_container(None)) == 0:
+        logger.info("no fds in the container")
+        return -1
+    return 0
+
+# LISTEN_FDS must be ignored unless LISTEN_PID is crun's pid.
+def test_listen_fds_other_pid():
+    for listen_pid in ["1", ""]:
+        files = listen_fds_in_container(listen_pid)
+        if len(files) > 0:
+            logger.info("LISTEN_PID=%r: unexpected fds in the container: %s", listen_pid, files)
+            return -1
     return 0
 
 def test_ioprio():
@@ -523,12 +571,32 @@ def test_invalid_id():
     except Exception as e:
         if hasattr(e, 'output') and e.output:
             err = e.output.decode()
-            if "invalid character `/` in the ID" in err:
+            if "invalid character" in err and "container ID" in err:
                 return 0
             logger.info("got error: %s", err)
         else:
             logger.info("got exception without output: %s", str(e))
         return -1
+    return 0
+
+def test_invalid_id_chars():
+    conf = base_config()
+    conf['process']['args'] = ['./init', 'echo', 'hello']
+    conf['process']['cwd'] = "/sbin"
+    add_all_namespaces(conf)
+    for invalid_id in [".", "..", ".foo", "foo bar", "foo/bar"]:
+        try:
+            out, _ = run_and_get_output(conf, id_container=invalid_id)
+            return -1
+        except Exception as e:
+            if hasattr(e, 'output') and e.output:
+                err = e.output.decode()
+                if "invalid" in err.lower():
+                    continue
+                logger.info("got error for id '%s': %s", invalid_id, err)
+            else:
+                logger.info("got exception without output for id '%s': %s", invalid_id, str(e))
+            return -1
     return 0
 
 def test_home_unknown_id():
@@ -567,18 +635,20 @@ def test_systemd_cgroups_path_def_slice():
 
     cid = None
     try:
-        _, cid = run_and_get_output(conf, hide_stderr=True, cgroup_manager="systemd", detach=True)
+        try:
+            _, cid = run_and_get_output(conf, hide_stderr=True, cgroup_manager="systemd", detach=True)
+        except subprocess.CalledProcessError:
+            return (77, "systemd cannot manage the container in this environment")
+
         state = run_crun_command(['state', cid])
         scope = json.loads(state)['systemd-scope']
 
-        want='system.slice'
-        if is_rootless():
-            want='user.slice'
+        want = 'user.slice' if is_rootless() else 'system.slice'
 
-        got = subprocess.check_output(['systemctl', 'show','-PSlice', scope], close_fds=False).decode().strip()
-        # try once more against the user manager, as if one exists, crun will prefer it; see bug #1197
+        got = systemctl_show(scope, 'Slice', user=is_rootless())
+        # try once more against the other manager
         if got != want:
-            got = subprocess.check_output(['systemctl', '--user', 'show','-PSlice', scope], close_fds=False).decode().strip()
+            got = systemctl_show(scope, 'Slice', user=not is_rootless())
 
         if got != want:
             logger.info("Got Slice %s, want %s", got, want)
@@ -600,6 +670,8 @@ all_tests = {
     "sd-notify-env" : test_sd_notify_env,
     "sd-notify-proxy": test_sd_notify_proxy,
     "listen_pid_env": test_listen_pid_env,
+    "listen-fds": test_listen_fds,
+    "listen-fds-other-pid": test_listen_fds_other_pid,
     "empty-home": test_empty_home,
     "delete-in-created-state": test_delete_in_created_state,
     "run-rootless-netns-with-userns" : test_run_rootless_netns_with_userns,
@@ -610,6 +682,7 @@ all_tests = {
     "ioprio": test_ioprio,
     "run-keep": test_run_keep,
     "invalid-id": test_invalid_id,
+    "invalid-id-chars": test_invalid_id_chars,
     "home-unknown-id": test_home_unknown_id,
     "help": test_start_help,
     "systemd-cgroups-path-def-slice": test_systemd_cgroups_path_def_slice,

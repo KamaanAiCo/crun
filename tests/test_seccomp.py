@@ -275,6 +275,141 @@ def test_seccomp_syscall_args():
         return -1
 
 
+def test_seccomp_more_than_six_syscall_args():
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['socket'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {'index': 0, 'value': value, 'op': 'SCMP_CMP_EQ'}
+                    for value in [0, 1, 3, 4, 5, 6, 7, 2]
+                ]
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'socket', '2']
+
+    try:
+        run_and_get_output(conf)
+    except subprocess.CalledProcessError as e:
+        if e.output is not None and b'Operation not permitted' in e.output:
+            return 0
+        logger.info("socket was not blocked by seccomp")
+        return -1
+    except Exception as e:
+        logger.info("Exception: %s", e)
+        return -1
+
+    logger.info("socket was not blocked by seccomp")
+    return -1
+
+
+def test_seccomp_args_mixed_indices():
+    """Conditions on distinct indices stop being ANDed once an index repeats.
+
+    Conditions on the same argument index are put in OR by turning each of
+    them into a rule of its own.  That is not limited to the repeated index:
+    every condition of the entry becomes a standalone rule, so conditions on
+    distinct indices are no longer combined.  The OCI runtime specification
+    does not define how conditions combine and this matches runc, see
+    https://github.com/opencontainers/runc/issues/2735.  Pin the behaviour so
+    that a change to it is a deliberate one.
+    """
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    # Reads as "domain is AF_INET or AF_NETLINK, and type is SOCK_DGRAM", but
+    # the three conditions end up as three independent rules.
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['socket'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {'index': 0, 'value': 2, 'op': 'SCMP_CMP_EQ'},
+                    {'index': 0, 'value': 16, 'op': 'SCMP_CMP_EQ'},
+                    {'index': 1, 'value': 2, 'op': 'SCMP_CMP_EQ'},
+                ]
+            }
+        ]
+    }
+
+    # socket(AF_UNIX, SOCK_DGRAM, 0): the domain matches neither alternative,
+    # yet the rule made out of the condition on arg 1 matches on its own.
+    conf['process']['args'] = ['/init', 'socket', '1']
+
+    try:
+        run_and_get_output(conf)
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        if 'Operation not permitted' in output:
+            return 0
+        logger.info("unexpected error: %s", output)
+        return -1
+    except Exception as e:
+        logger.info("Exception: %s", e)
+        return -1
+
+    logger.info("socket was not blocked by seccomp")
+    return -1
+
+
+def test_seccomp_cache_errno_ret():
+    """A different errnoRet must not reuse the filter cached for another one.
+
+    The generated filter is cached under a checksum of the seccomp
+    configuration, so everything that affects the filter has to be part of
+    that checksum.  errnoRet used to be left out, and two configurations
+    differing only by it shared a cache entry: the second container silently
+    got the filter built for the first one.
+    """
+    def run_with_errno_ret(errno_ret):
+        conf = base_config()
+        add_all_namespaces(conf)
+        conf['linux']['seccomp'] = {
+            'defaultAction': 'SCMP_ACT_ALLOW',
+            'syscalls': [
+                {
+                    'names': ['socket'],
+                    'action': 'SCMP_ACT_ERRNO',
+                    'errnoRet': errno_ret,
+                    'args': [
+                        {'index': 0, 'value': 2, 'op': 'SCMP_CMP_EQ'}
+                    ]
+                }
+            ]
+        }
+        conf['process']['args'] = ['/init', 'socket', '2']
+
+        try:
+            run_and_get_output(conf)
+        except subprocess.CalledProcessError as e:
+            return e.output.decode('utf-8', errors='ignore') if e.output else ''
+        return None
+
+    # Both runs share the state root, and so the seccomp cache.
+    out = run_with_errno_ret(1)
+    if out is None or 'Operation not permitted' not in out:
+        logger.info("EPERM run: socket was not blocked: %s", out)
+        return -1
+
+    out = run_with_errno_ret(13)
+    if out is None or 'Permission denied' not in out:
+        logger.info("EACCES run: stale filter served from the cache: %s", out)
+        return -1
+
+    return 0
+
+
 def test_seccomp_multiple_syscalls():
     """Test seccomp with multiple syscalls in one rule."""
     conf = base_config()
@@ -464,6 +599,243 @@ def test_annotation_seccomp_fail_unknown_syscall():
         return -1
 
 
+# Environment-related failures that mean the test cannot run here rather than
+# that crun rejected the configuration.
+unsupported_env_errors = ["mount", "proc", "permission", "rootfs", "private", "busy"]
+
+
+def run_and_expect_error(conf, expected):
+    """Run a container expected to be rejected, and check the error message.
+
+    Returns 0 if crun failed and the error message contains every string in
+    EXPECTED, 77 if the failure looks unrelated to the configuration under
+    test, and -1 otherwise.
+    """
+    try:
+        run_and_get_output(conf)
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        if all(x in output for x in expected):
+            return 0
+        if any(x in output.lower() for x in unsupported_env_errors):
+            return (77, "not available in nested namespaces")
+        logger.info("unexpected error message: %s", output)
+        return -1
+    except Exception as e:
+        if any(x in str(e).lower() for x in unsupported_env_errors):
+            return (77, "not available in nested namespaces")
+        logger.info("Exception: %s", e)
+        return -1
+
+    logger.info("container creation succeeded unexpectedly")
+    return -1
+
+
+def test_seccomp_invalid_default_action():
+    """An unknown defaultAction must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_NOT_AN_ACTION',
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["seccomp get action", "SCMP_ACT_NOT_AN_ACTION"])
+
+
+def test_seccomp_invalid_action():
+    """An unknown action on a syscall rule must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['ioctl'],
+                'action': 'SCMP_ACT_NOT_AN_ACTION',
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["seccomp get action", "SCMP_ACT_NOT_AN_ACTION"])
+
+
+def test_seccomp_action_missing_prefix():
+    """An action without the SCMP_ACT_ prefix must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'ALLOW',
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["seccomp get action", "ALLOW"])
+
+
+def test_seccomp_invalid_operator():
+    """An unknown argument comparison operator must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    # The action must differ from the default one, otherwise the rule is
+    # skipped before the operator is looked at.
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['ioctl'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {
+                        'index': 1,
+                        'value': 0x5401,
+                        'op': 'SCMP_CMP_NOT_AN_OP'
+                    }
+                ]
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["seccomp get operator", "SCMP_CMP_NOT_AN_OP"])
+
+
+def test_seccomp_operator_missing_prefix():
+    """An operator without the SCMP_CMP_ prefix must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['ioctl'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {
+                        'index': 1,
+                        'value': 0x5401,
+                        'op': 'EQ'
+                    }
+                ]
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["seccomp get operator", "EQ"])
+
+def test_seccomp_invalid_arg_index():
+    """An argument index outside the 0-5 range must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['socket'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {'index': 0, 'value': 1, 'op': 'SCMP_CMP_EQ'},
+                    {'index': 0, 'value': 2, 'op': 'SCMP_CMP_EQ'},
+                    {'index': 9, 'value': 3, 'op': 'SCMP_CMP_EQ'},
+                ]
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["invalid seccomp index `9`"])
+
+
+def test_seccomp_invalid_arg_index_unknown_syscall():
+    """An invalid argument index is reported even when the name is unknown.
+
+    Unknown syscall names are skipped with a warning, so the arguments have to
+    be validated independently of them, otherwise the bad index goes unnoticed.
+    """
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['crun_no_such_syscall'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1,
+                'args': [
+                    {'index': 9, 'value': 3, 'op': 'SCMP_CMP_EQ'},
+                ]
+            }
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["invalid seccomp index `9`"])
+
+
+def test_seccomp_invalid_flag():
+    """An unknown seccomp filter flag must be rejected."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'flags': ['SECCOMP_FILTER_FLAG_NOT_A_FLAG'],
+    }
+
+    conf['process']['args'] = ['/init', 'true']
+
+    return run_and_expect_error(conf, ["unknown seccomp option", "SECCOMP_FILTER_FLAG_NOT_A_FLAG"])
+
+
+def test_seccomp_exec_missing_bpf():
+    """exec must fail if seccomp is configured but the generated filter is missing."""
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+    }
+
+    conf['process']['args'] = ['/init', 'pause']
+
+    cid = None
+    try:
+        _, cid = run_and_get_output(conf, hide_stderr=True, command='run', detach=True)
+        run_crun_command(["exec", cid, "/init", "true"])
+
+        os.unlink(os.path.join(get_tests_root_status(), cid, "seccomp.bpf"))
+        try:
+            run_crun_command(["exec", cid, "/init", "true"])
+        except subprocess.CalledProcessError:
+            return 0
+        logger.info("exec succeeded without the seccomp filter")
+        return -1
+    except Exception as e:
+        logger.info("Exception: %s", e)
+        return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+
+
 all_tests = {
     "seccomp-listener": test_seccomp_listener,
     "seccomp-block-syscall": test_seccomp_block_syscall,
@@ -472,11 +844,23 @@ all_tests = {
     "seccomp-log-action": test_seccomp_log_action,
     "seccomp-kill-action": test_seccomp_kill_action,
     "seccomp-syscall-args": test_seccomp_syscall_args,
+    "seccomp-more-than-six-syscall-args": test_seccomp_more_than_six_syscall_args,
+    "seccomp-args-mixed-indices": test_seccomp_args_mixed_indices,
+    "seccomp-cache-errno-ret": test_seccomp_cache_errno_ret,
     "seccomp-multiple-syscalls": test_seccomp_multiple_syscalls,
     "seccomp-errno-default": test_seccomp_errno_default,
     "seccomp-comparison-ops": test_seccomp_comparison_ops,
     "seccomp-flags": test_seccomp_flags,
     "annotation-seccomp-fail-unknown-syscall": test_annotation_seccomp_fail_unknown_syscall,
+    "seccomp-invalid-default-action": test_seccomp_invalid_default_action,
+    "seccomp-invalid-action": test_seccomp_invalid_action,
+    "seccomp-action-missing-prefix": test_seccomp_action_missing_prefix,
+    "seccomp-invalid-operator": test_seccomp_invalid_operator,
+    "seccomp-operator-missing-prefix": test_seccomp_operator_missing_prefix,
+    "seccomp-invalid-arg-index": test_seccomp_invalid_arg_index,
+    "seccomp-invalid-arg-index-unknown-syscall": test_seccomp_invalid_arg_index_unknown_syscall,
+    "seccomp-invalid-flag": test_seccomp_invalid_flag,
+    "seccomp-exec-missing-bpf": test_seccomp_exec_missing_bpf,
 }
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <libcrun/cgroup-internal.h>
 
-typedef int (*test) ();
+#include "tap.h"
 
 /* Test read_proc_cgroup with cgroup v2 content */
 static int
@@ -191,9 +191,9 @@ test_convert_shares_to_weight ()
   if (weight < 90 || weight > 110)
     return -1;
 
-  /* Test intermediate value */
+  /* Test intermediate valid value */
   weight = convert_shares_to_weight (512);
-  if (weight == 0 || weight > 10000)
+  if (weight < 1 || weight > 10000)
     return -1;
 
   return 0;
@@ -205,14 +205,16 @@ test_convert_shares_boundary ()
 {
   uint64_t weight;
 
-  /* Value just above 2 should not return 1 */
+  /* Value just above minimum shares (2) should return
+   * close to but not less than minimum weight (1). */
   weight = convert_shares_to_weight (3);
-  if (weight == 0)
+  if (weight < 1 || weight > 3)
     return -1;
 
-  /* Value just below 262144 should not return 10000 */
+  /* Value just below maximum shares (262144) should return
+   * close to but not more than maximum weight (10000). */
   weight = convert_shares_to_weight (262143);
-  if (weight == 0 || weight > 10000)
+  if (weight < 9995 || weight > 10000)
     return -1;
 
   /* Ensure monotonicity: higher shares should give higher weight */
@@ -268,29 +270,9 @@ test_read_proc_cgroup_selective ()
   return 0;
 }
 
-static void
-run_and_print_test_result (const char *name, int id, test t)
-{
-  int ret = t ();
-  if (ret == 0)
-    printf ("ok %d - %s\n", id, name);
-  else if (ret == 77)
-    printf ("ok %d - %s #SKIP\n", id, name);
-  else
-    printf ("not ok %d - %s\n", id, name);
-}
-
-#define RUN_TEST(T)                            \
-  do                                           \
-    {                                          \
-      run_and_print_test_result (#T, id++, T); \
-  } while (0)
-
 int
 main ()
 {
-  int id = 1;
-  printf ("1..8\n");
   RUN_TEST (test_read_proc_cgroup_v2);
   RUN_TEST (test_read_proc_cgroup_v1);
   RUN_TEST (test_read_proc_cgroup_empty);
@@ -299,5 +281,6 @@ main ()
   RUN_TEST (test_convert_shares_boundary);
   RUN_TEST (test_read_proc_cgroup_null_params);
   RUN_TEST (test_read_proc_cgroup_selective);
+  print_tap_plan ();
   return 0;
 }

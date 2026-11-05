@@ -22,9 +22,35 @@ AC_PROG_SED
 AC_PROG_CC
 AM_PATH_PYTHON(3)
 
-AC_PATH_PROG(MD2MAN, go-md2man)
+dnl Compiler warnings.  They are not added to CFLAGS, which belongs to the
+dnl user, but to WARN_CFLAGS, that automake puts before CFLAGS so that the
+dnl user can still override any of them.
+AC_ARG_ENABLE([werror],
+	AS_HELP_STRING([--enable-werror], [treat compiler warnings as errors]))
 
-AM_CONDITIONAL([HAVE_MD2MAN], [test "x$ac_cv_path_MD2MAN" != x])
+WARN_CFLAGS=
+crun_save_CFLAGS="$CFLAGS"
+for crun_flag in \
+	-Wall \
+	-Wextra \
+	-Wvla \
+	-Walloca \
+	-Wduplicated-cond \
+	-Wduplicated-branches \
+	-Winit-self \
+	-Wshift-overflow=2 ; do
+	AC_MSG_CHECKING([whether $CC accepts $crun_flag])
+	dnl -Werror is needed as clang only warns about the flags it does not know.
+	CFLAGS="$crun_save_CFLAGS $crun_flag -Werror"
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [])],
+			  [AC_MSG_RESULT([yes])
+			   WARN_CFLAGS="$WARN_CFLAGS $crun_flag"],
+			  [AC_MSG_RESULT([no])])
+done
+CFLAGS="$crun_save_CFLAGS"
+
+AS_IF([test "x$enable_werror" = "xyes"], [WARN_CFLAGS="$WARN_CFLAGS -Werror"])
+AC_SUBST([WARN_CFLAGS])
 
 AC_CHECK_HEADERS([linux/openat2.h stdatomic.h linux/ioprio.h])
 
@@ -34,15 +60,19 @@ AC_CHECK_FUNCS(eaccess hsearch_r copy_file_range fgetxattr statx fgetpwent_r iss
 
 AC_CHECK_HEADER([error.h], [AC_CHECK_FUNC([error], AC_DEFINE([HAVE_ERROR_H], [1], [Define if error.h is usable]))])
 
+dnl tests/init, the container init used by the python tests, is the only thing
+dnl that has to be linked statically.  The unit tests and the fuzzing harness
+dnl do not care, so a compiler that cannot link statically -- honggfuzz's
+dnl hfuzz-clang, for one -- costs us the python tests, not the whole suite.
 case "${lt_cv_prog_compiler_static_works}" in
-	yes) build_tests=true ;;
+	yes) build_static_tests=true ;;
 	no)
-		AC_MSG_WARN([Static compilation not working. Test suite cannot be built / executed. Make sure to install glibc-static or equivalent.])
-		build_tests=false
+		AC_MSG_WARN([Static compilation not working. tests/init cannot be built, so the tests needing it are skipped. Make sure to install glibc-static or equivalent.])
+		build_static_tests=false
 		;;
 	*) ;;
 esac
-AM_CONDITIONAL([BUILD_TESTS], [test "x${build_tests}" = xtrue])
+AM_CONDITIONAL([BUILD_STATIC_TESTS], [test "x${build_static_tests}" = xtrue])
 
 AC_ARG_ENABLE(crun,
 AS_HELP_STRING([--enable-crun], [Include crun executable in installation (default: yes)]),
@@ -67,15 +97,7 @@ esac
 [enable_libcrun=true])
 AM_CONDITIONAL([ENABLE_LIBCRUN], [test "x${enable_libcrun}" = xtrue])
 
-dnl embedded yajl
-AC_ARG_ENABLE(embedded-yajl,
-AS_HELP_STRING([--enable-embedded-yajl], [Statically link a modified yajl version]),
-[
-case "${enableval}" in
-	yes) embedded_yajl=true ;;
-	no)  embedded_yajl=false ;;
-	*) AC_MSG_ERROR(bad value ${enableval} for --enable-embedded-yajl) ;;
-esac],[embedded_yajl=false])
+PKG_CHECK_MODULES([JSON_C], [json-c >= 0.14])
 
 AC_ARG_ENABLE(dynload-libcrun,
 AS_HELP_STRING([--enable-dynload-libcrun], [Dynamically load libcrun]),
@@ -87,11 +109,32 @@ case "${enableval}" in
 esac],[dynload_libcrun=false])
 AM_CONDITIONAL([DYNLOAD_LIBCRUN], [test x"$dynload_libcrun" = xtrue])
 
-AM_CONDITIONAL([HAVE_EMBEDDED_YAJL], [test x"$embedded_yajl" = xtrue])
-AM_COND_IF([HAVE_EMBEDDED_YAJL], [], [
-AC_SEARCH_LIBS(yajl_tree_get, [yajl], [AC_DEFINE([HAVE_YAJL], 1, [Define if libyajl is available])], [AC_MSG_ERROR([*** libyajl headers not found])])
-PKG_CHECK_MODULES([YAJL], [yajl >= 2.0.0])
+dnl embedded blake3
+AC_ARG_ENABLE(embedded-blake3,
+AS_HELP_STRING([--enable-embedded-blake3], [Use embedded blake3 (yes/no, default: autodetect)]),
+[
+case "${enableval}" in
+	yes) embedded_blake3=yes ;;
+	no)  embedded_blake3=no ;;
+	*) AC_MSG_ERROR(bad value ${enableval} for --enable-embedded-blake3) ;;
+esac],[embedded_blake3=auto])
+
+AS_IF([test "x$embedded_blake3" != "xyes"], [
+  PKG_CHECK_MODULES([BLAKE3], [libblake3], [
+    AC_DEFINE([HAVE_BLAKE3], 1, [Define if libblake3 is available])
+    LIBS="$LIBS $BLAKE3_LIBS"
+    CPPFLAGS="$CPPFLAGS $BLAKE3_CFLAGS"
+    embedded_blake3=no
+  ], [
+    AS_IF([test "x$embedded_blake3" = "xno"], [
+      AC_MSG_ERROR([*** libblake3 not found; install libblake3 or use --enable-embedded-blake3])
+    ], [
+      embedded_blake3=yes
+    ])
+  ])
 ])
+
+AM_CONDITIONAL([HAVE_EMBEDDED_BLAKE3], [test "x$embedded_blake3" = "xyes"])
 
 dnl libcap
 AC_ARG_ENABLE([caps],
@@ -161,6 +204,7 @@ AS_IF([test "x$enable_seccomp" != "xno"], [
 	AS_IF([test "$ac_cv_header_seccomp_h" = "yes"], [
 		AC_SEARCH_LIBS(seccomp_rule_add, [seccomp], [AC_DEFINE([HAVE_SECCOMP], 1, [Define if seccomp is available])], [AC_MSG_ERROR([*** libseccomp headers not found])])
 		AC_SEARCH_LIBS(seccomp_arch_resolve_name, [seccomp], [AC_DEFINE([SECCOMP_ARCH_RESOLVE_NAME], 1, [Define if seccomp_arch_resolve_name is available])], [ ])
+		AC_CHECK_FUNCS(seccomp_export_bpf_mem)
 	])
 ])
 
@@ -256,9 +300,10 @@ AS_IF([test "x$use_fPIC" = "xyes"], [
 ])
 
 dnl criu
-AC_ARG_ENABLE([criu], AS_HELP_STRING([--disable-criu], [Disable CRIU based checkpoint/restore support]))
+AC_ARG_ENABLE([criu], AS_HELP_STRING([--enable-criu], [CRIU based checkpoint/restore support (yes/no, default: autodetect)]))
 AS_IF([test "x$enable_criu" != "xno"], [
 	PKG_CHECK_MODULES([CRIU], [criu >= 3.15], [have_criu="yes"], [have_criu="no"
+		AS_IF([test "x$enable_criu" = "xyes"], [AC_MSG_ERROR([*** CRIU headers not found; install libcriu or use --disable-criu])])
 		AC_MSG_NOTICE([CRIU headers not found, building without CRIU support])])
 	PKG_CHECK_MODULES([CRIU_JOIN_NS], [criu > 3.16], [have_criu_join_ns="yes"], [have_criu_join_ns="no"
 	        AC_MSG_NOTICE([CRIU version doesn't support join-ns API])])
@@ -411,6 +456,24 @@ AS_IF([test "x$enable_coverage" = "xyes"], [
 ])
 
 AM_CONDITIONAL([ENABLE_COVERAGE], [test "x$enable_coverage" = "xyes"])
+
+dnl address and undefined behaviour sanitizers
+AC_ARG_ENABLE([sanitizers],
+	AS_HELP_STRING([--enable-sanitizers], [Build with the address and undefined behaviour sanitizers (for testing only)]),
+	[enable_sanitizers=$enableval], [enable_sanitizers=no])
+
+AS_IF([test "x$enable_sanitizers" = "xyes"], [
+	dnl Without -fno-sanitize-recover the undefined behaviour sanitizer only
+	dnl prints what it finds and lets the program carry on, so a test suite
+	dnl run would stay green no matter what it reported.
+	SANITIZER_CFLAGS="-fsanitize=address -fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g"
+	SANITIZER_LDFLAGS="-fsanitize=address -fsanitize=undefined"
+])
+
+dnl Substituted unconditionally, and empty unless --enable-sanitizers was
+dnl given, so that the flags can simply be appended where they are needed.
+AC_SUBST([SANITIZER_CFLAGS])
+AC_SUBST([SANITIZER_LDFLAGS])
 
 AC_SEARCH_LIBS([argp_parse], [argp], [], [AC_MSG_ERROR([*** argp functions not found - install libargp or argp_standalone])])
 

@@ -29,9 +29,6 @@
 
 #include "crun.h"
 #include "checkpoint.h"
-#include "libcrun/container.h"
-#include "libcrun/status.h"
-#include "libcrun/utils.h"
 
 enum
 {
@@ -48,15 +45,16 @@ enum
   OPTION_NETWORK_LOCK_METHOD,
   OPTION_LSM_PROFILE,
   OPTION_LSM_MOUNT_CONTEXT,
+  OPTION_NO_NEW_KEYRING,
 };
 
 static char doc[] = "OCI runtime";
 
 static const char *bundle = NULL;
 
-static libcrun_context_t crun_context;
+static libcrun_context_t *crun_context;
 
-static libcrun_checkpoint_restore_t cr_options;
+static struct libcrun_checkpoint_restore_options_s cr_options;
 
 static struct argp_option options[]
     = { { "bundle", 'b', "DIR", 0, "container bundle (default \".\")", 0 },
@@ -72,9 +70,10 @@ static struct argp_option options[]
           "path to a socket that will receive the ptmx end of the tty", 0 },
         { "file-locks", OPTION_FILE_LOCKS, 0, 0, "allow file locks", 0 },
         { "manage-cgroups-mode", OPTION_MANAGE_CGROUPS_MODE, "MODE", 0, "cgroups mode: 'soft' (default), 'ignore', 'full' and 'strict'", 0 },
-        { "network-lock", OPTION_NETWORK_LOCK_METHOD, 0, 0, "set network lock method", 0 },
+        { "network-lock", OPTION_NETWORK_LOCK_METHOD, "METHOD", 0, "set network lock method", 0 },
         { "lsm-profile", OPTION_LSM_PROFILE, "VALUE", 0, "Specify an LSM profile to be used during restore in the form of TYPE:NAME", 0 },
         { "lsm-mount-context", OPTION_LSM_MOUNT_CONTEXT, "VALUE", 0, "Specify an LSM mount context to be used during restore", 0 },
+        { "no-new-keyring", OPTION_NO_NEW_KEYRING, 0, 0, "keep the same session key", 0 },
         {
             0,
         } };
@@ -130,7 +129,7 @@ parse_opt (int key, char *arg, struct argp_state *state)
       break;
 
     case OPTION_PID_FILE:
-      crun_context.pid_file = argp_mandatory_argument (arg, state);
+      libcrun_context_set_pid_file (crun_context, argp_mandatory_argument (arg, state));
       break;
 
     case OPTION_MANAGE_CGROUPS_MODE:
@@ -149,6 +148,10 @@ parse_opt (int key, char *arg, struct argp_state *state)
       cr_options.lsm_mount_context = argp_mandatory_argument (arg, state);
       break;
 
+    case OPTION_NO_NEW_KEYRING:
+      libcrun_context_set_no_new_keyring (crun_context, true);
+      break;
+
     default:
       return ARGP_ERR_UNKNOWN;
     }
@@ -165,6 +168,10 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
   cleanup_free char *cr_path = NULL;
   int first_arg;
   int ret;
+
+  crun_context = new_libcrun_context (global_args);
+  cr_options.struct_size = sizeof (cr_options);
+  cr_options.manage_cgroups_mode = -1;
 
   argp_parse (&run_argp, argc, argv, ARGP_IN_ORDER, &first_arg, &cr_options);
   crun_assert_n_args (argc - first_arg, 1, 2);
@@ -192,11 +199,12 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
         libcrun_fail_with_error (errno, "chdir `%s` failed", bundle);
     }
 
-  ret = init_libcrun_context (&crun_context, argv[first_arg], global_args, err);
+  ret = init_libcrun_context (crun_context, argv[first_arg], global_args, err);
   if (UNLIKELY (ret < 0))
-    return ret;
-
-  cr_options.manage_cgroups_mode = -1;
+    {
+      libcrun_context_free (crun_context);
+      return ret;
+    }
 
   if (cr_options.image_path == NULL)
     {
@@ -212,6 +220,8 @@ crun_command_restore (struct crun_global_arguments *global_args, int argc, char 
       cr_options.image_path = cr_path;
     }
 
-  crun_context.bundle = bundle;
-  return libcrun_container_restore (&crun_context, argv[first_arg], &cr_options, err);
+  libcrun_context_set_bundle (crun_context, bundle);
+  ret = libcrun_container_restore (crun_context, argv[first_arg], &cr_options, err);
+  libcrun_context_free (crun_context);
+  return ret;
 }

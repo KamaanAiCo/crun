@@ -4,24 +4,22 @@ set -e
 set -x
 
 if test "$(id -u)" != 0; then
-	echo "run as root"
-	exit 1
+    echo "run as root"
+    exit 1
 fi
 
 (
-cd /crun
-git config --global --add safe.directory /crun
-git clean -fdx
-./autogen.sh
-./configure
-make -j "$(nproc)"
+    cd /crun
+    git config --global --add safe.directory /crun
+    git clean -fdx
+    ./autogen.sh
+    ./configure --enable-embedded-blake3
+    make -j "$(nproc)"
 )
 
-# Install and run runtime-tools' validation tests
+# Run runtime-tools' validation tests
 git clone --depth=1 https://github.com/opencontainers/runtime-tools
 cd runtime-tools
-make -j "$(nproc)" tool
-make -j "$(nproc)" install
 
 export GOCACHE=/var/tmp/gocache
 export TMPDIR=/var/tmp

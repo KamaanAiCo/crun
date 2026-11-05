@@ -192,7 +192,9 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
   /*
     if (request.type != device.type)
       goto next_block:
-    if ((request.access & device.access) != request.access)
+    if (accept && (request.access & device.access) != request.access)
+      goto next_block:
+    if (! accept && (request.access & device.access) == 0)
       goto next_block:
     if (device.major != '*' && request.major != device.major) == 0)
       goto next_block:
@@ -219,7 +221,8 @@ bpf_program_append_dev (struct bpf_program *program, const char *access, char ty
       struct bpf_insn i[] = {
         BPF_MOV32_REG (BPF_REG_1, BPF_REG_3),
         BPF_ALU32_IMM (BPF_AND, BPF_REG_1, bpf_access),
-        BPF_JMP_REG (BPF_JNE, BPF_REG_1, BPF_REG_3, number_instructions - 2),
+        accept ? BPF_JMP_REG (BPF_JNE, BPF_REG_1, BPF_REG_3, number_instructions - 2)
+               : BPF_JMP_IMM (BPF_JEQ, BPF_REG_1, 0, number_instructions - 2),
       };
       number_instructions -= 3;
       program = bpf_program_append (program, i, sizeof (i));
@@ -290,9 +293,9 @@ read_all_progs (int dirfd, uint32_t **progs_out, size_t *n_progs_out, libcrun_er
       attr.query.prog_ids = ptr_to_u64 (progs);
 
       ret = bpf (BPF_PROG_QUERY, &attr, sizeof (attr));
+      if (ret >= 0 || errno != ENOSPC)
+        break;
     }
-  while (ret < 0 && errno == ENOSPC)
-    ;
 
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "bpf query");
@@ -618,7 +621,7 @@ libcrun_ebpf_query_cgroup_progs (const char *cgroup_path, uint32_t **progs_out, 
 #else
   cleanup_close int cgroup_fd = -1;
 
-  cgroup_fd = open (cgroup_path, O_RDONLY | O_CLOEXEC);
+  cgroup_fd = open (cgroup_path, O_PATH | O_CLOEXEC);
   if (UNLIKELY (cgroup_fd < 0))
     return crun_make_error (err, errno, "open cgroup path `%s`", cgroup_path);
 

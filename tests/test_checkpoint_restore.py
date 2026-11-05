@@ -18,6 +18,7 @@
 import time
 import json
 import os
+import signal
 import subprocess
 import errno
 import tempfile
@@ -60,24 +61,21 @@ def _get_criu_version():
     return version
 
 
-def _get_cmdline(cid, tests_root):
-    s = {}
-    for _ in range(50):
-        try:
-            if os.path.exists(os.path.join(tests_root, 'root/%s/status' % cid)):
-                s = json.loads(run_crun_command(["state", cid]))
-                break
-            else:
-                time.sleep(0.1)
-        except Exception as e:
-            time.sleep(0.1)
+def _check_cr_requirements(min_criu_version=0):
+    if is_rootless():
+        return 77, "CRIU requires root"
+    if 'CRIU' not in get_crun_feature_string():
+        return 77, "crun built without CRIU support"
+    if min_criu_version and _get_criu_version() < min_criu_version:
+        return 77, "old CRIU version (need >= %d)" % min_criu_version
 
-    if len(s) == 0:
-        logger.info("_get_cmdline: no state found for container %s", cid)
-        return ""
+    return None
 
-    if s['status'] != "running":
-        logger.info("_get_cmdline: container %s status is '%s', expected 'running'", cid, s['status'])
+
+def _get_cmdline(cid):
+    s = wait_for_state(cid)
+    if s is None:
+        logger.info("_get_cmdline: container %s is not running", cid)
         return ""
     if s['id'] != cid:
         logger.info("_get_cmdline: container id mismatch: got '%s', expected '%s'", s['id'], cid)
@@ -87,10 +85,10 @@ def _get_cmdline(cid, tests_root):
     return ""
 
 
-def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
+def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None, after_restore_cb=None):
     cid = None
     cr_dir = os.path.join(get_tests_root(), 'checkpoint')
-    work_dir = 'work-dir'
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
     try:
         logger.info("run_cr_test: starting container")
         _, cid = run_and_get_output(
@@ -101,7 +99,7 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
         )
         logger.info("run_cr_test: container started with id=%s", cid)
 
-        first_cmdline = _get_cmdline(cid, get_tests_root())
+        first_cmdline = _get_cmdline(cid)
         logger.info("run_cr_test: first_cmdline='%s'", first_cmdline)
         if first_cmdline == "":
             logger.info("run_cr_test: FAILED - first_cmdline is empty")
@@ -139,12 +137,15 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
         ])
         logger.info("run_cr_test: restore completed")
 
-        second_cmdline = _get_cmdline(cid, get_tests_root())
+        second_cmdline = _get_cmdline(cid)
         logger.info("run_cr_test: second_cmdline='%s'", second_cmdline)
         if first_cmdline != second_cmdline:
             logger.info("run_cr_test: FAILED - cmdline mismatch: first='%s' second='%s'", first_cmdline, second_cmdline)
             return -1
         logger.info("run_cr_test: SUCCESS - cmdlines match")
+
+        if after_restore_cb is not None:
+            return after_restore_cb(cid)
     except Exception as e:
         logger.info("run_cr_test: EXCEPTION - %s", e)
         raise
@@ -155,12 +156,91 @@ def run_cr_test(conf, before_checkpoint_cb=None, before_restore_cb=None):
     return 0
 
 
-def test_cr_pre_dump():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+# A foreground restore must forward any signal crun gets to the container
+# init, the same way a foreground run does.
+def test_cr_restore_forward_signal():
+    if r := _check_cr_requirements():
+        return r
 
-    if _get_criu_version() < 31700:
-        return 77
+    cid = None
+    crun = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-forward-signal')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'exit-on-signal']
+    add_all_namespaces(conf)
+    # Not a pipe: were crun killed, CRIU could still hold it open.
+    stderr = tempfile.TemporaryFile()
+
+    def crun_stderr():
+        stderr.seek(0)
+        return stderr.read().decode(errors='replace')
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_restore_forward_signal: the container did not start")
+            return -1
+
+        run_crun_command([
+            "checkpoint",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        bundle = os.path.join(get_tests_root(), cid.split('-')[1])
+        crun = subprocess.Popen([
+            get_crun_path(),
+            "--cgroup-manager", get_cgroup_manager(),
+            "--root", get_tests_root_status(),
+            "restore",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            "--bundle=%s" % bundle,
+            cid
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=stderr, close_fds=False)
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_restore_forward_signal: the container was not restored: %s",
+                        crun_stderr())
+            return -1
+
+        # The init exits with 42 once it gets SIGUSR1, so that is the status
+        # crun is expected to report.  Were the signal acted upon by crun
+        # itself, crun would be killed by it (the default disposition of
+        # SIGUSR1), and the container left running.
+        crun.send_signal(signal.SIGUSR1)
+        try:
+            ret = crun.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            logger.info("test_cr_restore_forward_signal: crun did not exit")
+            return -1
+
+        if ret != 42:
+            logger.info("test_cr_restore_forward_signal: crun exited with %d, expected 42: %s",
+                        ret, crun_stderr())
+            return -1
+    finally:
+        if crun is not None and crun.poll() is None:
+            crun.kill()
+            crun.wait()
+        stderr.close()
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+def test_cr_pre_dump():
+    if r := _check_cr_requirements(min_criu_version=31700):
+        return r
 
     has_pre_dump = False
     for i in run_crun_command(["checkpoint", "--help"]).split('\n'):
@@ -169,7 +249,7 @@ def test_cr_pre_dump():
             break
 
     if not has_pre_dump:
-        return 77
+        return 77, "crun built without pre-dump support"
 
     def _get_pre_dump_size(cr_dir):
         size = 0
@@ -191,7 +271,7 @@ def test_cr_pre_dump():
 
     cid = None
     cr_dir = os.path.join(get_tests_root(), 'pre-dump')
-    work_dir = 'work-dir'
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
     try:
         _, cid = run_and_get_output(
             conf,
@@ -200,7 +280,7 @@ def test_cr_pre_dump():
             detach=True
         )
 
-        first_cmdline = _get_cmdline(cid, get_tests_root())
+        first_cmdline = _get_cmdline(cid)
         if first_cmdline == "":
             logger.info("test_cr_pre_dump: failed to get first cmdline")
             return -1
@@ -252,7 +332,7 @@ def test_cr_pre_dump():
             cid
         ])
 
-        second_cmdline = _get_cmdline(cid, get_tests_root())
+        second_cmdline = _get_cmdline(cid)
         if first_cmdline != second_cmdline:
             logger.info("test_cr_pre_dump: cmdline mismatch after restore")
             return -1
@@ -267,8 +347,8 @@ def test_cr_pre_dump():
 
 
 def test_cr():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+    if r := _check_cr_requirements():
+        return r
 
     conf = base_config()
     conf['process']['args'] = ['/init', 'pause']
@@ -276,12 +356,174 @@ def test_cr():
     return run_cr_test(conf)
 
 
-def test_cr_with_ext_ns():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+def test_cr_masked_paths():
+    if r := _check_cr_requirements():
+        return r
 
-    if _get_criu_version() < 31601:
-        return 77
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    # Both a directory and a file.  A masked directory is a bind mount of a
+    # shared empty directory under the state root, which is an external
+    # mount for CRIU, and must be found under the same key on restore.
+    conf['linux']['maskedPaths'] = ['/sys/firmware', '/proc/kcore']
+    return run_cr_test(conf)
+
+
+# Once it is restored, the container is running and decides what its stdin,
+# stdout and stderr point to.  That must not make the restore fail.
+def test_cr_long_stdin_path():
+    if r := _check_cr_requirements():
+        return r
+
+    data_dir = os.path.join(get_tests_root(), 'long-stdin-path')
+    os.makedirs(data_dir)
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'long-stdin-path', '/data']
+    add_all_namespaces(conf)
+    conf['mounts'].append({"destination": "/data", "type": "bind", "source": data_dir, "options": ["bind", "rw"]})
+
+    def wait_for_ready():
+        for _ in range(100):
+            if os.path.exists(os.path.join(data_dir, 'ready')):
+                return
+            time.sleep(0.1)
+        raise Exception("the container is not ready to be checkpointed")
+
+    def mark_restored():
+        with open(os.path.join(data_dir, 'restored'), 'w'):
+            pass
+
+    return run_cr_test(conf, before_checkpoint_cb=wait_for_ready, before_restore_cb=mark_restored)
+# exec loads the seccomp filter from the state directory, which is deleted
+# by the checkpoint, so the restore must generate it again.
+def test_cr_exec_seccomp():
+    if r := _check_cr_requirements():
+        return r
+    if 'SECCOMP' not in get_crun_feature_string():
+        return 77, "crun built without seccomp support"
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, netns=False)
+    conf['linux']['seccomp'] = {
+        'defaultAction': 'SCMP_ACT_ALLOW',
+        'syscalls': [
+            {
+                'names': ['unshare'],
+                'action': 'SCMP_ACT_ERRNO',
+                'errnoRet': 1
+            }
+        ]
+    }
+
+    def check_exec_seccomp(cid):
+        out = run_crun_command(["exec", cid, "/init", "cat", "/proc/self/status"])
+        mode = parse_proc_status(out).get('Seccomp')
+        if mode != '2':
+            logger.info("test_cr_exec_seccomp: expected seccomp mode 2 after restore, got %s", mode)
+            return -1
+        return 0
+
+    return run_cr_test(conf, after_restore_cb=check_exec_seccomp)
+# CRIU gets the source of an external mount from crun and its flags from the
+# image, i.e. from whatever was mounted at that path when the container was
+# checkpointed.  Each source must be restored with the flags the configuration
+# asks for it anyway.
+def test_cr_mount_flags():
+    if r := _check_cr_requirements():
+        return r
+
+    cid = None
+    cr_dir = os.path.join(get_tests_root(), 'checkpoint-mount-flags')
+    work_dir = os.path.join(get_tests_root(), 'work-dir')
+    ro_dir = os.path.join(get_tests_root(), 'mount-flags-ro')
+    rw_dir = os.path.join(get_tests_root(), 'mount-flags-rw')
+    os.makedirs(ro_dir)
+    os.makedirs(rw_dir)
+
+    masked = ['/sys/firmware', '/sys/kernel']
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+    conf['linux']['maskedPaths'] = masked
+    conf['mounts'] += [
+        {"destination": "/a/data", "type": "bind", "source": ro_dir,
+         "options": ["bind", "ro", "nosuid", "nodev", "noexec"]},
+        {"destination": "/b/data", "type": "bind", "source": rw_dir, "options": ["bind", "rw"]},
+        {"destination": "/c", "type": "bind", "source": ro_dir, "options": ["bind", "ro"]},
+    ]
+
+    try:
+        _, cid = run_and_get_output(
+            conf,
+            all_dev_null=True,
+            use_popen=True,
+            detach=True
+        )
+
+        if wait_for_state(cid) is None:
+            logger.info("test_cr_mount_flags: the container did not start")
+            return -1
+
+        # A mount point cannot be renamed, but its parent directory can, also
+        # from inside the container: exchange the read-only and the read-write
+        # mount before the checkpoint.
+        bundle = os.path.join(get_tests_root(), cid.split('-')[1])
+        rootfs = os.path.join(bundle, 'rootfs')
+        os.rename(os.path.join(rootfs, 'a'), os.path.join(rootfs, 'tmp'))
+        os.rename(os.path.join(rootfs, 'b'), os.path.join(rootfs, 'a'))
+        os.rename(os.path.join(rootfs, 'tmp'), os.path.join(rootfs, 'b'))
+
+        run_crun_command([
+            "checkpoint",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            cid
+        ])
+
+        run_crun_command([
+            "restore",
+            "-d",
+            "--image-path=%s" % cr_dir,
+            "--work-path=%s" % work_dir,
+            "--bundle=%s" % bundle,
+            cid
+        ])
+
+        s = wait_for_state(cid)
+        if s is None:
+            logger.info("test_cr_mount_flags: the container was not restored")
+            return -1
+
+        found = 0
+        with open("/proc/%s/mountinfo" % s['pid']) as f:
+            for line in f:
+                _, _, _, root, mountpoint, options = line.split()[:6]
+                expected = set()
+                if root.endswith('/mount-flags-ro'):
+                    found += 1
+                    expected = {'ro'} if mountpoint == '/c' else {'ro', 'nosuid', 'nodev', 'noexec'}
+                elif mountpoint in masked:
+                    expected = {'ro'}
+                if not expected.issubset(options.split(',')):
+                    logger.info("test_cr_mount_flags: `%s` restored at `%s` with `%s`, expected `%s`",
+                                root, mountpoint, options, ','.join(sorted(expected)))
+                    return -1
+
+        if found != 2:
+            logger.info("test_cr_mount_flags: found %d mounts of `%s`, expected 2", found, ro_dir)
+            return -1
+    finally:
+        if cid is not None:
+            run_crun_command(["delete", "-f", cid])
+    return 0
+
+
+def test_cr_with_ext_ns():
+    if r := _check_cr_requirements(min_criu_version=31601):
+        return r
 
     conf = base_config()
     conf['process']['args'] = ['/init', 'pause']
@@ -304,6 +546,102 @@ def test_cr_with_ext_ns():
             ns.update({'path': os.path.join(ns_path, 'uts')})
 
     return run_cr_test(conf)
+
+
+# A failed restore has no container status, so nothing can destroy its
+# cgroup later: crun must not leave it behind.
+def test_cr_failed_restore_cgroup_cleanup():
+    if r := _check_cr_requirements():
+        return r
+    if not is_cgroup_v2_unified():
+        return (77, "requires cgroup v2")
+    if get_cgroup_manager() == 'systemd':
+        return (77, "test uses cgroupfs-style paths")
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf)
+
+    cgroup_path = f'/test-failed-restore-{os.getpid()}'
+    conf['linux']['cgroupsPath'] = cgroup_path
+
+    host_cgroup_dir = f'/sys/fs/cgroup{cgroup_path}'
+
+    image_broken = False
+
+    def break_image():
+        nonlocal image_broken
+        os.unlink(os.path.join(get_tests_root(), 'checkpoint', 'inventory.img'))
+        image_broken = True
+
+    try:
+        run_cr_test(conf, before_restore_cb=break_image)
+        logger.info("the restore was expected to fail")
+        return -1
+    except subprocess.CalledProcessError:
+        if not image_broken:
+            raise
+
+    if os.path.exists(host_cgroup_dir):
+        logger.info("cgroup directory %s still exists after the failed restore", host_cgroup_dir)
+        os.rmdir(host_cgroup_dir)
+        return -1
+
+    return 0
+
+
+def test_cr_named_cgroup_hierarchy():
+    if r := _check_cr_requirements():
+        return r
+    if not is_cgroup_v2_unified():
+        return 77, "requires cgroup v2"
+
+    # A named cgroup v1 hierarchy, such as the ones left behind by the CRIU
+    # test suite.  Every process is in its root.  crun leaves it alone, so
+    # the restore must not create the container cgroup in it: otherwise
+    # every checkpoint/restore cycle copies the hierarchy into itself.
+    name = "crun-test-%d-%d" % (os.getpid(), int(time.monotonic() * 1000))
+    mnt = tempfile.mkdtemp()
+    try:
+        subprocess.run(["mount", "-t", "cgroup", "-o", "none,name=" + name, "cgroup", mnt],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        os.rmdir(mnt)
+        return 77, "cannot mount a named cgroup v1 hierarchy"
+
+    def cgroups():
+        return [os.path.join(root, d)[len(mnt):] for root, dirs, _ in os.walk(mnt) for d in dirs]
+
+    try:
+        conf = base_config()
+        conf['process']['args'] = ['/init', 'pause']
+        add_all_namespaces(conf)
+        ret = run_cr_test(conf)
+        if ret != 0:
+            return ret
+        created = cgroups()
+        if created:
+            logger.info("cgroups created in the name=%s hierarchy: %s", name, created)
+            return -1
+        return 0
+    finally:
+        # The container processes may take a moment to go away after delete.
+        deadline = time.monotonic() + 5
+        while True:
+            for root, dirs, _ in os.walk(mnt, topdown=False):
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, d))
+                    except OSError:
+                        pass
+            left = cgroups()
+            if not left or time.monotonic() > deadline:
+                break
+            time.sleep(0.1)
+        if left:
+            logger.info("cannot remove cgroups from the name=%s hierarchy: %s", name, left)
+        subprocess.run(["umount", mnt], check=False)
+        os.rmdir(mnt)
 
 
 def _remove_file(filename):
@@ -373,22 +711,22 @@ def _run_cr_test_with_config(config_name, log_names, extra_configs=None, annotat
 
 
 def test_cr_with_runc_config():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+    if r := _check_cr_requirements():
+        return r
     return _run_cr_test_with_config("runc", ("runc-dump.log", "runc-restore.log"))
 
 
 def test_cr_with_crun_config():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+    if r := _check_cr_requirements():
+        return r
     # runc.conf should be ignored by crun
     extra = {"runc": "log-file=test.log"}
     return _run_cr_test_with_config("crun", ("crun-dump.log", "crun-restore.log"), extra_configs=extra)
 
 
 def test_cr_with_annotation_config():
-    if is_rootless() or 'CRIU' not in get_crun_feature_string():
-        return 77
+    if r := _check_cr_requirements():
+        return r
     # Create annotation config file
     annotations = {"org.criu.config": "/etc/criu/annotation.conf"}
     _create_criu_config("annotation", f"log-file=annotation.log")
@@ -399,7 +737,14 @@ def test_cr_with_annotation_config():
 
 all_tests = {
     "checkpoint-restore": test_cr,
+    "checkpoint-restore-masked-paths": test_cr_masked_paths,
+    "checkpoint-restore-long-stdin-path": test_cr_long_stdin_path,
+    "checkpoint-restore-exec-seccomp": test_cr_exec_seccomp,
+    "checkpoint-restore-mount-flags": test_cr_mount_flags,
     "checkpoint-restore-ext-ns": test_cr_with_ext_ns,
+    "checkpoint-restore-failed-cgroup-cleanup": test_cr_failed_restore_cgroup_cleanup,
+    "checkpoint-restore-named-cgroup-hierarchy": test_cr_named_cgroup_hierarchy,
+    "checkpoint-restore-forward-signal": test_cr_restore_forward_signal,
     "checkpoint-restore-pre-dump": test_cr_pre_dump,
     "checkpoint-restore-with-runc-config": test_cr_with_runc_config,
     "checkpoint-restore-with-crun-config": test_cr_with_crun_config,

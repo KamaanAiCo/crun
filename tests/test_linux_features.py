@@ -233,6 +233,37 @@ def test_process_apparmor_profile():
         return -1
 
 
+def test_process_apparmor_profile_not_loaded():
+    """Test the error message for an AppArmor profile which is not loaded."""
+
+    if not os.path.exists('/sys/kernel/security/apparmor'):
+        return (77, "AppArmor not available")
+
+    if is_rootless():
+        return (77, "requires root")
+
+    profile_name = "crun-test-definitely-not-loaded"
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+    conf['process']['apparmorProfile'] = profile_name
+
+    try:
+        run_and_get_output(conf, hide_stderr=False)
+        logger.info("test failed: container started with an unloaded AppArmor profile")
+        return -1
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        expected = "apply apparmor profile `%s`: profile not loaded" % profile_name
+        if expected not in output:
+            logger.info("test failed: expected '%s' in output, got: %s", expected, output.strip())
+            return -1
+        return 0
+    except Exception as e:
+        logger.info("test failed: %s", e)
+        return -1
+
+
 def test_process_apparmor_profile_userns():
     """Test AppArmor profile is applied inside a user namespace.
 
@@ -513,9 +544,9 @@ def test_process_rlimits_multiple():
             'hard': 4096
         },
         {
-            'type': 'RLIMIT_NPROC',
-            'soft': 1024,
-            'hard': 2048
+            'type': 'RLIMIT_CORE',
+            'soft': 0,
+            'hard': 0
         },
         {
             'type': 'RLIMIT_STACK',
@@ -658,15 +689,9 @@ def test_user_namespace_mapping():
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # Skip on nested namespace issues
-        if any(x in output.lower() for x in ["user", "mapping", "mount", "proc", "rootfs", "private", "busy"]):
-            return (77, "user namespace mapping not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if any(x in str(e).lower() for x in ["user", "mapping", "mount", "proc", "rootfs", "private", "busy"]):
-            return (77, "user namespace mapping not available")
         logger.info("test failed: %s", e)
         return -1
 
@@ -914,28 +939,14 @@ def test_set_id_init_root():
     conf['process']['args'] = ['/init', 'true']
     conf['process']['user'] = {'uid': 0, 'gid': 0}
 
-    # Add UID/GID mappings
-    conf['linux']['uidMappings'] = [
-        {'containerID': 0, 'hostID': os.getuid(), 'size': 1}
-    ]
-    conf['linux']['gidMappings'] = [
-        {'containerID': 0, 'hostID': os.getgid(), 'size': 1}
-    ]
-
     try:
         out, _ = run_and_get_output(conf, hide_stderr=False)
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # Skip on nested namespace issues
-        if any(x in output.lower() for x in ["mount", "proc", "user", "rootfs", "private", "busy"]):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if any(x in str(e).lower() for x in ["mount", "proc", "user", "rootfs", "private", "busy"]):
-            return (77, "user namespace not available")
         logger.info("test failed: %s", e)
         return -1
 
@@ -978,6 +989,9 @@ def test_set_id_init_nonroot():
 def test_set_id_with_additional_gids():
     """Test set_id_init with additional groups."""
 
+    if is_rootless():
+        return (77, "requires root to map multiple IDs")
+
     conf = base_config()
     add_all_namespaces(conf, userns=True)
     conf['process']['args'] = ['/init', 'true']
@@ -1000,15 +1014,9 @@ def test_set_id_with_additional_gids():
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # Skip on nested namespace issues
-        if any(x in output.lower() for x in ["mount", "proc", "user", "gid", "rootfs", "private", "busy"]):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if any(x in str(e).lower() for x in ["mount", "proc", "user", "gid", "rootfs", "private", "busy"]):
-            return (77, "user namespace not available")
         logger.info("test failed: %s", e)
         return -1
 
@@ -1418,14 +1426,6 @@ def test_sysfs_userns_no_netns_no_cgroup_mount():
     conf['process']['args'] = ['/init', 'true']
     conf['process']['user'] = {'uid': 0, 'gid': 0}
 
-    # Add UID/GID mappings for the user namespace
-    conf['linux']['uidMappings'] = [
-        {'containerID': 0, 'hostID': os.getuid(), 'size': 1}
-    ]
-    conf['linux']['gidMappings'] = [
-        {'containerID': 0, 'hostID': os.getgid(), 'size': 1}
-    ]
-
     # Set up mounts with sysfs but WITHOUT /sys/fs/cgroup mount
     # This exercises the has_mount_for() == false branch at linux.c:1186
     conf['mounts'] = [
@@ -1446,15 +1446,9 @@ def test_sysfs_userns_no_netns_no_cgroup_mount():
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # Skip on nested namespace issues
-        if any(x in output.lower() for x in ["mount", "proc", "sysfs", "user", "rootfs", "private", "busy"]):
-            return (77, "sysfs mount in userns not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if any(x in str(e).lower() for x in ["mount", "proc", "sysfs", "user", "rootfs", "private", "busy"]):
-            return (77, "sysfs mount in userns not available")
         logger.info("test failed: %s", e)
         return -1
 
@@ -1472,14 +1466,6 @@ def test_sysfs_userns_no_netns_with_cgroup_mount():
     add_all_namespaces(conf, userns=True, netns=False)
     conf['process']['args'] = ['/init', 'true']
     conf['process']['user'] = {'uid': 0, 'gid': 0}
-
-    # Add UID/GID mappings for the user namespace
-    conf['linux']['uidMappings'] = [
-        {'containerID': 0, 'hostID': os.getuid(), 'size': 1}
-    ]
-    conf['linux']['gidMappings'] = [
-        {'containerID': 0, 'hostID': os.getgid(), 'size': 1}
-    ]
 
     # Set up mounts with sysfs AND /sys/fs/cgroup mount
     # This exercises the has_mount_for() == true branch at linux.c:1195
@@ -1507,15 +1493,9 @@ def test_sysfs_userns_no_netns_with_cgroup_mount():
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # Skip on nested namespace issues
-        if any(x in output.lower() for x in ["mount", "proc", "sysfs", "user", "cgroup", "rootfs", "private", "busy"]):
-            return (77, "sysfs mount in userns with cgroup not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if any(x in str(e).lower() for x in ["mount", "proc", "sysfs", "user", "cgroup", "rootfs", "private", "busy"]):
-            return (77, "sysfs mount in userns with cgroup not available")
         logger.info("test failed: %s", e)
         return -1
 
@@ -1831,6 +1811,7 @@ all_tests = {
     "process-no-new-privileges": test_process_no_new_privileges,
     "process-oom-score-adj": test_process_oom_score_adj,
     "process-apparmor-profile": test_process_apparmor_profile,
+    "process-apparmor-profile-not-loaded": test_process_apparmor_profile_not_loaded,
     "process-apparmor-profile-userns": test_process_apparmor_profile_userns,
     "process-selinux-label": test_process_selinux_label,
     "process-umask": test_process_umask,

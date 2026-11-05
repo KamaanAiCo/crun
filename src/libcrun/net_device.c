@@ -152,7 +152,6 @@ name_to_index (int sock, const char *ifname, char *buffer, size_t buffer_size, l
   struct nlmsghdr *nlh;
   struct nl_req *req;
   uint32_t seq;
-  int index = 0;
   ssize_t len;
   int ret;
 
@@ -191,15 +190,11 @@ name_to_index (int sock, const char *ifname, char *buffer, size_t buffer_size, l
       if (nlh->nlmsg_type == RTM_NEWLINK)
         {
           struct ifinfomsg *ifi = NLMSG_DATA (nlh);
-          index = ifi->ifi_index;
-          return index;
+          return ifi->ifi_index;
         }
     }
 
-  if (index == 0)
-    return crun_make_error (err, 0, "could not find device `%s`", ifname);
-
-  return index;
+  return crun_make_error (err, 0, "could not find device `%s`", ifname);
 }
 
 static int
@@ -436,34 +431,15 @@ do_move_link_to_ns_and_wait (int sock, char *buffer, size_t buffer_size, int ifi
   return wait_for_ack (sock, seq, buffer, buffer_size, err);
 }
 
-int
-move_network_device (const char *ifname, const char *newifname, int netns_fd, libcrun_error_t *err)
+/* Run the setup in the target namespace.  It is done in a separate function
+   so that no variable of the caller is live across the vfork.  */
+static int
+setup_network_device_in_ns (char *buffer, size_t buffer_size, int netns_fd, const char *newifname,
+                            struct ip_addr *ips, libcrun_error_t *err)
 {
-  const size_t buffer_size = 8192;
-  cleanup_ip_addrs struct ip_addr *ips = NULL;
-  cleanup_free char *buffer = xmalloc (buffer_size);
-  cleanup_close int sock = -1;
   int wait_status;
-  int ifindex;
   pid_t pid;
   int ret;
-
-  sock = open_netlink_fd (err);
-  if (sock < 0)
-    return sock;
-
-  ifindex = name_to_index (sock, ifname, buffer, buffer_size, err);
-  if (UNLIKELY (ifindex < 0))
-    return ifindex;
-
-  ret = get_ip_addresses (sock, ifindex, &ips, buffer, buffer_size, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  /* Move the device to the target network namespace.  */
-  ret = do_move_link_to_ns_and_wait (sock, buffer, buffer_size, ifindex, netns_fd, newifname, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
 
   /* must be vfork to propagate the error from the child proc.  */
   pid = vfork ();
@@ -494,4 +470,34 @@ move_network_device (const char *ifname, const char *newifname, int netns_fd, li
     }
 
   return 0;
+}
+
+int
+move_network_device (const char *ifname, const char *newifname, int netns_fd, libcrun_error_t *err)
+{
+  const size_t buffer_size = 8192;
+  cleanup_ip_addrs struct ip_addr *ips = NULL;
+  cleanup_free char *buffer = xmalloc (buffer_size);
+  cleanup_close int sock = -1;
+  int ifindex;
+  int ret;
+
+  sock = open_netlink_fd (err);
+  if (sock < 0)
+    return sock;
+
+  ifindex = name_to_index (sock, ifname, buffer, buffer_size, err);
+  if (UNLIKELY (ifindex < 0))
+    return ifindex;
+
+  ret = get_ip_addresses (sock, ifindex, &ips, buffer, buffer_size, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* Move the device to the target network namespace.  */
+  ret = do_move_link_to_ns_and_wait (sock, buffer, buffer_size, ifindex, netns_fd, newifname, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  return setup_network_device_in_ns (buffer, buffer_size, netns_fd, newifname, ips, err);
 }

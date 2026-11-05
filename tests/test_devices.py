@@ -16,8 +16,10 @@
 # along with crun.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
+import stat
 import subprocess
 import shutil
+import json
 from tests_utils import *
 
 def test_mode_device():
@@ -95,7 +97,7 @@ def test_deny_devices():
 
     try:
         os.stat("/dev/fuse")
-    except:
+    except OSError:
         return (77, "/dev/fuse device not available")
 
     conf = base_config()
@@ -122,7 +124,7 @@ def test_deny_devices():
 def test_create_or_bind_mount_device():
     try:
         os.stat("/dev/fuse")
-    except:
+    except OSError:
         return (77, "/dev/fuse device not available")
 
     conf = base_config()
@@ -150,7 +152,7 @@ def test_allow_device():
 
     try:
         os.stat("/dev/fuse")
-    except:
+    except OSError:
         return (77, "/dev/fuse device not available")
 
     conf = base_config()
@@ -180,7 +182,7 @@ def test_allow_access():
 
     try:
         os.stat("/dev/fuse")
-    except:
+    except OSError:
         return (77, "/dev/fuse device not available")
 
     conf = base_config()
@@ -311,17 +313,17 @@ def test_net_devices():
                     if "address: 10.1.2.3" not in out[0]:
                         logger.info("address not found in output")
                         logger.info("full output: %s", out[0])
-                        return 1
+                        return -1
                     if specify_broadcast:
                         if "broadcast: 10.1.2.254" not in out[0]:
                             logger.info("broadcast address not found in output")
                             logger.info("full output: %s", out[0])
-                            return 1
+                            return -1
                     else:
                         if "broadcast" in out[0]:
                             logger.info("broadcast address found in output when it shouldn't be")
                             logger.info("full output: %s", out[0])
-                            return 1
+                            return -1
                 except Exception as e:
                     logger.info("test_net_devices exception: %s", e)
                     return -1
@@ -368,6 +370,242 @@ def test_mknod_char_device():
         return -1
     return 0
 
+def test_mknod_existing_device():
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    def prepare_rootfs(rootfs):
+        os.makedirs(os.path.join(rootfs, "data"))
+        os.mknod(os.path.join(rootfs, "data", "null"), 0o666 | stat.S_IFCHR, os.makedev(1, 3))
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'ischar', '/data/null']
+    conf['linux']['devices'] = [{"path": "/data/null", "type": "c", "major": 1, "minor": 3}]
+    try:
+        run_and_get_output(conf, hide_stderr=True, callback_prepare_rootfs=prepare_rootfs)
+    except Exception as e:
+        logger.info("test_mknod_existing_device failed: %s", e)
+        return -1
+    return 0
+
+def test_mknod_conflicting_device():
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    def prepare_regular_file(rootfs):
+        os.makedirs(os.path.join(rootfs, "data"))
+        open(os.path.join(rootfs, "data", "conflict"), "w").close()
+
+    def prepare_other_device(rootfs):
+        os.makedirs(os.path.join(rootfs, "data"))
+        os.mknod(os.path.join(rootfs, "data", "conflict"), 0o666 | stat.S_IFCHR, os.makedev(1, 5))
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'true']
+    conf['linux']['devices'] = [{"path": "/data/conflict", "type": "c", "major": 1, "minor": 3}]
+
+    for prepare, expected in [(prepare_regular_file, "has incorrect file type"),
+                              (prepare_other_device, "has incorrect major:minor 1:5, expected 1:3")]:
+        try:
+            run_and_get_output(conf, callback_prepare_rootfs=prepare)
+            logger.info("test_mknod_conflicting_device: %s: container unexpectedly started", prepare.__name__)
+            return -1
+        except subprocess.CalledProcessError as e:
+            output = e.output.decode(errors='ignore')
+            if expected not in output:
+                logger.info("test_mknod_conflicting_device: %s: unexpected error: %s", prepare.__name__, output)
+                return -1
+    return 0
+
+def test_userns_precreated_devices_flags():
+    conf = base_config()
+    add_all_namespaces(conf, userns=True)
+    if not is_rootless():
+        fullMapping = [{"containerID": 0, "hostID": 0, "size": 4294967295}]
+        conf['linux']['uidMappings'] = fullMapping
+        conf['linux']['gidMappings'] = fullMapping
+
+    conf['process']['args'] = ['/init', 'cat', '/proc/self/mountinfo']
+
+    devices = ["/dev/null", "/dev/zero", "/dev/full", "/dev/tty",
+               "/dev/random", "/dev/urandom"]
+
+    out, _ = run_and_get_output(conf, hide_stderr=True)
+
+    found = set()
+    for line in out.split("\n"):
+        fields = line.split(" ")
+        if len(fields) < 6 or fields[4] not in devices:
+            continue
+        found.add(fields[4])
+        opts = fields[5].split(",")
+        if "nosuid" not in opts or "noexec" not in opts:
+            logger.error("device %s missing nosuid,noexec: %s", fields[4], fields[5])
+            return -1
+
+    if not found:
+        return (77, "no precreated device mounts (mknod path taken)")
+    return 0
+
+def test_dev_null_symlink_not_reopened():
+    host_file = os.path.join(get_tests_root(), "host-file")
+    with open(host_file, "w") as f:
+        f.write("host content")
+
+    fake_dev = os.path.join(get_tests_root(), "fake-dev")
+    os.makedirs(fake_dev)
+    os.symlink("/host-file", os.path.join(fake_dev, "null"))
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['args'] = ['/init', 'echo', 'breakout']
+    conf['mounts'] = [i for i in conf['mounts'] if not i['destination'].startswith("/dev")]
+    conf['mounts'].append({"destination": "/host-file", "type": "bind",
+                           "source": host_file, "options": ["bind", "rw"]})
+    conf['mounts'].append({"destination": "/dev", "type": "bind",
+                           "source": fake_dev, "options": ["bind", "rw"]})
+
+    output = None
+    try:
+        run_and_get_output(conf)
+    except Exception as e:
+        output = e.output.decode()
+
+    with open(host_file) as f:
+        content = f.read()
+    if content != "host content":
+        logger.error("the host file was written through `/dev/null`: %s", content)
+        return -1
+
+    if output is None:
+        logger.error("the container was not refused")
+        return -1
+
+    if "open `/dev/null`" not in output:
+        logger.error("the container failed for a different reason: %s", output)
+        return -1
+
+    return 0
+
+def test_dev_console_symlink_does_not_escape_rootfs():
+    escaped = os.path.join(get_tests_root(), "escaped-console")
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['process']['terminal'] = True
+    conf['process']['args'] = ['/init', 'true']
+    conf['mounts'] = [i for i in conf['mounts'] if not i['destination'].startswith("/dev")]
+    # a hook forces the deferred pivot_root, so the rootfs is still reached
+    # through the host file system when the devices are created.
+    conf['hooks'] = {"createRuntime": [{"path": "/bin/true"}]}
+
+    def prepare_rootfs(rootfs):
+        os.symlink(escaped, os.path.join(rootfs, "dev", "console"))
+
+    output = None
+    try:
+        run_and_get_output(conf, callback_prepare_rootfs=prepare_rootfs)
+    except Exception as e:
+        output = e.output.decode()
+
+    if os.path.lexists(escaped):
+        logger.error("`%s` was created outside the rootfs", escaped)
+        return -1
+
+    if output is None:
+        logger.error("the container was not refused")
+        return -1
+
+    if "create file `console`" not in output:
+        logger.error("the container failed for a different reason: %s", output)
+        return -1
+
+    return 0
+
+def test_dev_symlink_does_not_populate_outside_rootfs():
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    workdir = os.path.join(get_tests_root(), "dev-symlink")
+    bundle = os.path.join(workdir, "bundle")
+    rootfs = os.path.join(bundle, "rootfs")
+    outside_dev = os.path.join(workdir, "outside-dev")
+    runtime_root = os.path.join(workdir, "run")
+    shutil.rmtree(workdir, ignore_errors=True)
+    try:
+        os.makedirs(rootfs)
+        os.makedirs(outside_dev)
+        os.makedirs(runtime_root)
+        ptmx_marker = os.path.join(outside_dev, "ptmx")
+        with open(ptmx_marker, "w") as f:
+            f.write("outside marker\n")
+
+        os.symlink(outside_dev, os.path.join(rootfs, "dev"))
+        shutil.copy2(get_init_path(), os.path.join(rootfs, "init"))
+        os.chmod(os.path.join(rootfs, "init"), 0o755)
+
+        conf = {
+            "ociVersion": "1.0.2",
+            "process": {
+                "terminal": False,
+                "user": {"uid": 0, "gid": 0},
+                "args": ["/init", "true"],
+                "env": ["PATH=/bin"],
+                "cwd": "/",
+            },
+            "root": {
+                "path": "rootfs",
+                "readonly": True,
+            },
+            "mounts": [
+                {"destination": "/proc", "type": "proc", "source": "proc"},
+            ],
+            "linux": {
+                "namespaces": [
+                    {"type": "mount"},
+                    {"type": "pid"},
+                    {"type": "ipc"},
+                    {"type": "uts"},
+                ],
+            },
+        }
+        with open(os.path.join(bundle, "config.json"), "w") as f:
+            f.write(json.dumps(conf))
+
+        container_id = "test-dev-symlink"
+        crun = get_crun_path()
+
+        try:
+            subprocess.check_output([crun, "--root", runtime_root, "run", "-b", bundle, container_id],
+                                    stderr=subprocess.STDOUT)
+            logger.info("container unexpectedly started with rootfs /dev symlink")
+            return -1
+        except subprocess.CalledProcessError:
+            pass
+        finally:
+            subprocess.run([crun, "--root", runtime_root, "delete", "-f", container_id],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        outside_entries = sorted(os.listdir(outside_dev))
+        if outside_entries != ["ptmx"]:
+            logger.info("rootfs /dev symlink target was populated outside rootfs: %s", outside_entries)
+            return -1
+
+        if os.path.islink(ptmx_marker):
+            logger.info("rootfs /dev symlink target ptmx marker was replaced with a symlink")
+            return -1
+
+        with open(ptmx_marker) as f:
+            if f.read() != "outside marker\n":
+                logger.info("rootfs /dev symlink target ptmx marker content changed")
+                return -1
+
+        return 0
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
 def test_allow_device_read_only():
     if is_rootless():
         return (77, "requires root privileges")
@@ -375,12 +613,12 @@ def test_allow_device_read_only():
     try:
         # Best effort load
         subprocess.run(["modprobe", "null_blk", "nr_devices=1"])
-    except:
+    except OSError:
         pass
     try:
         st = os.stat("/dev/nullb0")
         major, minor = os.major(st.st_rdev), os.minor(st.st_rdev)
-    except:
+    except OSError:
         return (77, "/dev/nullb0 device not available")
 
     conf = base_config()
@@ -411,21 +649,80 @@ def test_allow_device_read_only():
     try:
         run_and_get_output(conf)
         logger.info("test_allow_device_read_only: write access was unexpectedly allowed.")
-        return 1
+        return -1
     except Exception as e:
         output_str = getattr(e, 'output', b'').decode(errors='ignore')
         if "Operation not permitted" in output_str or "Permission denied" in output_str:
             return 0
         else:
             logger.info("test_allow_device_read_only (write attempt) failed with: %s, output: %s", e, output_str)
-            return 1
+            return -1
 
-    return 1
+    return -1
+
+def test_deny_device_write():
+    if is_rootless():
+        return (77, "requires root privileges")
+
+    try:
+        os.stat("/dev/fuse")
+    except OSError:
+        return (77, "/dev/fuse device not available")
+
+    conf = base_config()
+    add_all_namespaces(conf)
+
+    conf['linux']['devices'] = [{
+        "path": "/dev/controlledchar",
+        "type": "c",
+        "major": 10,
+        "minor": 229,
+        "fileMode": 0o0666
+    }]
+    conf['linux']['resources'] = {
+        "devices": [
+            {"allow": False, "access": "rwm"},
+            {"allow": True, "type": "c", "major": 10, "minor": 229, "access": "rwm"},
+            {"allow": False, "type": "c", "major": 10, "minor": 229, "access": "w"},
+        ]
+    }
+
+    conf['process']['args'] = ['/init', 'open', '/dev/controlledchar']
+    try:
+        run_and_get_output(conf)
+    except Exception as e:
+        output_str = getattr(e, 'output', b'').decode(errors='ignore')
+        if "systemd does not support deny rules" in output_str:
+            return (77, "deny rules not supported by the cgroup manager")
+        logger.info("test_deny_device_write failed: %s", e)
+        return -1
+
+    # A deny rule must apply also when other access bits are requested with it.
+    for mode in ['openwronly', 'openrdwr']:
+        conf['process']['args'] = ['/init', mode, '/dev/controlledchar']
+        try:
+            run_and_get_output(conf)
+            logger.info("test_deny_device_write: %s was unexpectedly allowed.", mode)
+            return -1
+        except Exception as e:
+            output_str = getattr(e, 'output', b'').decode(errors='ignore')
+            if "Operation not permitted" not in output_str:
+                logger.info("test_deny_device_write (%s) failed with: %s, output: %s", mode, e, output_str)
+                return -1
+
+    return 0
 
 all_tests = {
     "mknod-fifo-device": test_mknod_fifo_device,
     "mknod-char-device": test_mknod_char_device,
+    "mknod-existing-device": test_mknod_existing_device,
+    "mknod-conflicting-device": test_mknod_conflicting_device,
+    "dev-null-symlink-not-reopened": test_dev_null_symlink_not_reopened,
+    "dev-console-symlink-does-not-escape-rootfs": test_dev_console_symlink_does_not_escape_rootfs,
+    "dev-symlink-does-not-populate-outside-rootfs": test_dev_symlink_does_not_populate_outside_rootfs,
+    "userns-precreated-devices-flags": test_userns_precreated_devices_flags,
     "allow-device-read-only": test_allow_device_read_only,
+    "deny-device-write": test_deny_device_write,
     "owner-device" : test_owner_device,
     "deny-devices" : test_deny_devices,
     "allow-device" : test_allow_device,

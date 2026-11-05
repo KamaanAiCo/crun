@@ -52,6 +52,9 @@
 #  define CGROUP_WEIGHT_DEFAULT ((uint64_t) 100)
 #  define CGROUP_WEIGHT_MAX ((uint64_t) 10000)
 
+/* The CPU quota period used by the kernel (and systemd) by default, in us.  */
+#  define DEFAULT_CPU_QUOTA_PERIOD ((uint64_t) 100000)
+
 #  define SYSTEMD_MISSING_PROPERTIES_DIR ".cache/systemd-missing-properties"
 
 #  define IS_WILDCARD(x) (x <= 0)
@@ -114,7 +117,8 @@ static void
 get_systemd_scope_and_slice (const char *id, bool user_slice, const char *cgroup_path,
                              char **scope, char **slice)
 {
-  char *n;
+  const char *n;
+  char *p;
 
   if (cgroup_path == NULL || cgroup_path[0] == '\0')
     {
@@ -128,16 +132,16 @@ get_systemd_scope_and_slice (const char *id, bool user_slice, const char *cgroup
   else
     {
       xasprintf (scope, "%s.scope", n + 1);
-      n = strchr (*scope, ':');
-      if (n)
-        *n = '-';
+      p = strchr (*scope, ':');
+      if (p)
+        *p = '-';
     }
   if (slice)
     {
       *slice = xstrdup (cgroup_path);
-      n = strchr (*slice, ':');
-      if (n)
-        *n = '\0';
+      p = strchr (*slice, ':');
+      if (p)
+        *p = '\0';
 
       /* Ref: https://github.com/opencontainers/runc/blob/main/docs/systemd.md#systemd-unit-name-and-placement */
       if (is_empty_string (*slice))
@@ -165,6 +169,11 @@ setup_rt_runtime (runtime_spec_schema_config_linux_resources *resources,
 
   if (resources == NULL || resources->cpu == NULL)
     return 0;
+
+  /* Without a cgroup path append_paths() below would end up at the cgroup
+     root, so refuse rather than change the root cgroup settings.  */
+  if (is_empty_string (path))
+    return crun_make_error (err, 0, "cannot set the RT runtime without a cgroup");
 
   if (has_suffix (path, ".scope"))
     need_set_parent = false;
@@ -229,7 +238,7 @@ setup_missing_cpu_options_for_systemd (runtime_spec_schema_config_linux_resource
   if (resources == NULL || resources->cpu == NULL)
     return 0;
 
-  if (! resources->cpu->burst_present)
+  if (! resources->cpu->burst_present && ! (cgroup2 && resources->cpu->idle_present))
     return 0;
 
   for (parent = 0; parent < 2; parent++)
@@ -250,6 +259,14 @@ setup_missing_cpu_options_for_systemd (runtime_spec_schema_config_linux_resource
       ret = write_cpu_burst (dirfd, cgroup2, resources->cpu, err);
       if (UNLIKELY (ret < 0))
         return ret;
+
+      /* cpu.idle can be set by systemd (via CPUWeight=0), but not reset.  */
+      if (cgroup2)
+        {
+          ret = write_cpu_idle (dirfd, resources->cpu, err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+        }
     }
 
   return 0;
@@ -299,6 +316,18 @@ setup_cpuset_for_systemd_v1 (runtime_spec_schema_config_linux_resources *resourc
   return 0;
 }
 
+/* Build PATH from the cgroup slice FROM, appending SUFFIX when set.  */
+static int
+compute_finalized_path (char **path, const char *from, const char *suffix, libcrun_error_t *err)
+{
+  if (suffix == NULL)
+    {
+      *path = xstrdup (from);
+      return 0;
+    }
+  return append_paths (path, err, from, suffix, NULL);
+}
+
 static int
 systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
                   int cgroup_mode, const char *suffix, libcrun_error_t *err)
@@ -343,15 +372,10 @@ systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
       if (UNLIKELY (to == NULL))
         return crun_make_error (err, 0, "cannot parse `%s`", PROC_SELF_CGROUP);
       *to = '\0';
-      if (suffix == NULL)
-        path = xstrdup (from);
-      else
-        {
-          ret = append_paths (&path, err, from, suffix, NULL);
-          if (UNLIKELY (ret < 0))
-            return ret;
-        }
+      ret = compute_finalized_path (&path, from, suffix, err);
       *to = '\n';
+      if (UNLIKELY (ret < 0))
+        return ret;
 
       if (geteuid ())
         return 0;
@@ -410,15 +434,10 @@ systemd_finalize (struct libcrun_cgroup_args *args, char **path_out,
         if (UNLIKELY (to == NULL))
           return crun_make_error (err, 0, "cannot parse `%s`", PROC_SELF_CGROUP);
         *to = '\0';
-        if (suffix == NULL)
-          path = xstrdup (from);
-        else
-          {
-            ret = append_paths (&path, err, from, suffix, NULL);
-            if (UNLIKELY (ret < 0))
-              return ret;
-          }
+        ret = compute_finalized_path (&path, from, suffix, err);
         *to = '\n';
+        if (UNLIKELY (ret < 0))
+          return ret;
 
         ret = append_paths (&dir, err, CGROUP_ROOT, path, NULL);
         if (UNLIKELY (ret < 0))
@@ -621,6 +640,36 @@ append_systemd_annotation (sd_bus_message *m, const char *name, size_t name_len,
       name = tmp_name;
     }
 
+  /* A *USec property is always an uint64, so, like runc does, accept any
+     number of seconds (possibly with a fractional part, and with an
+     optional integer type), and convert it to uint64 microseconds.  */
+  if (factor != 1)
+    {
+      static const char *types[] = { "uint64 ", "int64 ", "uint32 ", "int32 ", NULL };
+      const char *num = it;
+      char *endptr = NULL;
+      double v;
+      size_t i;
+
+      for (i = 0; types[i]; i++)
+        if (has_prefix (num, types[i]))
+          {
+            num += strlen (types[i]);
+            break;
+          }
+
+      errno = 0;
+      v = strtod (num, &endptr);
+      if (UNLIKELY (errno != 0 || endptr == num || *endptr || v < 0 || v * factor >= 18446744073709551615.0))
+        return crun_make_error (err, errno, "invalid value for `%s`: `%s`", name, value);
+
+      sd_err = sd_bus_message_append (m, "(sv)", name, "t", (uint64_t) (v * factor));
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append `%s`", name);
+
+      return 0;
+    }
+
   if ((strcmp (it, "true") == 0) || (strcmp (it, "false") == 0))
     {
       bool b = *it == 't';
@@ -638,7 +687,7 @@ append_systemd_annotation (sd_bus_message *m, const char *name, size_t name_len,
 
       it = v_start = xstrdup (value);
 
-      end = strchr (it + 1, '\'');
+      end = strchr (v_start + 1, '\'');
       if (end == NULL)
         return crun_make_error (err, 0, "invalid variant `%s`", value);
       *end = '\0';
@@ -670,7 +719,7 @@ append_systemd_annotation (sd_bus_message *m, const char *name, size_t name_len,
           if (n_parts == parts_size - 1)
             {
               parts_size += 32;
-              parts = xrealloc (parts, parts_size);
+              parts = xrealloc (parts, sizeof (char *) * parts_size);
             }
           parts[n_parts] = NULL;
           if (next == NULL)
@@ -798,6 +847,20 @@ open_sd_bus_connection (sd_bus **bus, libcrun_error_t *err)
   return 0;
 }
 
+static const char *
+get_string_from_unified_map (runtime_spec_schema_config_linux_resources *resources, const char *name)
+{
+  size_t i;
+
+  if (resources == NULL || resources->unified == NULL)
+    return NULL;
+
+  for (i = 0; i < resources->unified->len; i++)
+    if (strcmp (resources->unified->keys[i], name) == 0)
+      return resources->unified->values[i];
+  return NULL;
+}
+
 static int
 get_value_from_unified_map (runtime_spec_schema_config_linux_resources *resources, const char *name,
                             uint64_t *value, libcrun_error_t *err)
@@ -818,7 +881,7 @@ get_value_from_unified_map (runtime_spec_schema_config_linux_resources *resource
           }
 
         errno = 0;
-        *value = (uint64_t) strtoll (resources->unified->values[i], &endptr, 10);
+        *value = strtoull (resources->unified->values[i], &endptr, 10);
         if (UNLIKELY (errno))
           return crun_make_error (err, errno, "invalid value for `%s`: %s", name,
                                   resources->unified->values[i]);
@@ -871,7 +934,25 @@ get_memory_swap_max (runtime_spec_schema_config_linux_resources *resources, uint
 {
   if (resources->memory && resources->memory->swap_present)
     {
-      *limit = resources->memory->swap;
+      runtime_spec_schema_config_linux_resources_memory *memory = resources->memory;
+      int64_t mem = memory->limit_present ? memory->limit : 0;
+
+      /* The OCI swap limit is for memory+swap, while MemorySwapMax is for
+         swap only, so convert it, like it is done for memory.swap.max.  */
+      if (memory->swap == -1 || (mem == -1 && memory->swap == 0))
+        {
+          *limit = UINT64_MAX;
+          return 1;
+        }
+      /* 0 means unset.  */
+      if (memory->swap == 0)
+        return 0;
+      if (mem <= 0)
+        return crun_make_error (err, 0, "cannot set swap limit without the memory limit");
+      if (memory->swap < mem)
+        return crun_make_error (err, 0, "cannot set memory+swap limit less than the memory limit");
+
+      *limit = memory->swap - mem;
       return 1;
     }
 
@@ -890,6 +971,20 @@ get_cpu_weight (runtime_spec_schema_config_linux_resources *resources, uint64_t 
     return ret;
   if (ret > 0 && value == 1)
     has_idle = true;
+  if (resources->cpu && resources->cpu->idle_present && resources->cpu->idle == 1)
+    has_idle = true;
+
+  /* The unified map takes precedence, like with the cgroupfs driver.  */
+  ret = get_value_from_unified_map (resources, "cpu.weight", weight, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+  if (ret > 0)
+    {
+      if (has_idle)
+        return crun_make_error (err, 0, "cannot set both `cpu.idle` and `cpu.weight`");
+
+      return 1;
+    }
 
   if (resources->cpu && resources->cpu->shares_present)
     {
@@ -900,17 +995,6 @@ get_cpu_weight (runtime_spec_schema_config_linux_resources *resources, uint64_t 
       if (resources->cpu->shares == 0)
         return 0;
       *weight = convert_shares_to_weight (resources->cpu->shares);
-      return 1;
-    }
-
-  ret = get_value_from_unified_map (resources, "cpu.weight", weight, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-  if (ret > 0)
-    {
-      if (has_idle)
-        return crun_make_error (err, 0, "cannot set both `cpu.idle` and `cpu.weight`");
-
       return 1;
     }
   if (has_idle)
@@ -928,7 +1012,7 @@ read_uint64_value (const char *str, uint64_t *value, libcrun_error_t *err)
   char *endptr = NULL;
 
   errno = 0;
-  *value = (uint64_t) strtoll (str, &endptr, 10);
+  *value = strtoull (str, &endptr, 10);
   if (UNLIKELY (errno))
     return crun_make_error (err, errno, "invalid value: %s", str);
   if (endptr && *endptr)
@@ -1325,9 +1409,6 @@ append_devices (sd_bus_message *m,
         return ret;
     }
 
-  if (resources == NULL)
-    return 0;
-
   for (i = find_first_rule_no_default (resources->devices, resources->devices_len); i < resources->devices_len; i++)
     {
       runtime_spec_schema_defs_linux_device_cgroup *d = resources->devices[i];
@@ -1381,7 +1462,7 @@ has_bpf_fs ()
 {
   struct statfs stat;
 
-  return statfs (SYS_FS_BPF, &stat) == 0 && (stat.f_type == BPF_FS_MAGIC);
+  return statfs (SYS_FS_BPF, &stat) == 0 && (stat.f_type == (typeof (stat.f_type)) BPF_FS_MAGIC);
 }
 
 static int
@@ -1510,6 +1591,59 @@ add_bpf_program (sd_bus_message *m,
   return 0;
 }
 
+/* Append CPUQuotaPeriodUSec and CPUQuotaPerSecUSec, the way runc does.  */
+static int
+append_cpu_quota (sd_bus_message *m, char **missing_properties,
+                  runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
+{
+  uint64_t period = (resources->cpu && resources->cpu->period_present) ? resources->cpu->period : 0;
+  int64_t quota = (resources->cpu && resources->cpu->quota_present) ? resources->cpu->quota : 0;
+  const char *cpu_max = get_string_from_unified_map (resources, "cpu.max");
+  int sd_err;
+
+  /* The unified map takes precedence, like with the cgroupfs driver.  */
+  if (cpu_max)
+    {
+      uint64_t max_period;
+      bool has_period;
+      int ret;
+
+      ret = parse_cpu_max (cpu_max, &quota, &max_period, &has_period, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+      if (has_period)
+        period = max_period;
+    }
+
+  if (period && ! property_missing_p (missing_properties, "CPUQuotaPeriodUSec"))
+    {
+      sd_err = sd_bus_message_append (m, "(sv)", "CPUQuotaPeriodUSec", "t", period);
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append CPUQuotaPeriodUSec");
+    }
+
+  if ((quota != 0 || period) && ! property_missing_p (missing_properties, "CPUQuotaPerSecUSec"))
+    {
+      /* USEC_INFINITY in systemd.  */
+      uint64_t quota_per_sec = UINT64_MAX;
+
+      if (quota > 0)
+        {
+          quota_per_sec = ((uint64_t) quota * 1000000) / (period ? period : DEFAULT_CPU_QUOTA_PERIOD);
+          /* systemd converts CPUQuotaPerSecUSec to a percentage of CPU, so round it
+             up to the next 10ms, to not give the container less than it asked for.  */
+          if (quota_per_sec % 10000)
+            quota_per_sec = ((quota_per_sec / 10000) + 1) * 10000;
+        }
+
+      sd_err = sd_bus_message_append (m, "(sv)", "CPUQuotaPerSecUSec", "t", quota_per_sec);
+      if (UNLIKELY (sd_err < 0))
+        return crun_make_error (err, -sd_err, "sd-bus message append CPUQuotaPerSecUSec");
+    }
+
+  return 0;
+}
+
 static int
 append_resources (sd_bus_message *m,
                   bool is_update,
@@ -1573,22 +1707,9 @@ append_resources (sd_bus_message *m,
   APPEND_UINT64 ("MemorySwapMax", get_memory_swap_max);
   APPEND_UINT64 ("TasksMax", get_pids_max);
 
-  if (resources->cpu)
-    {
-      /* do not bother with systemd internal representation unless both values are specified */
-      if (resources->cpu->quota > 0 && resources->cpu->period)
-        {
-          uint64_t quota = resources->cpu->quota;
-
-          /* this conversion was copied from runc.  */
-          quota = (quota * 1000000) / resources->cpu->period;
-          if (quota % 10000)
-            quota = ((quota / 10000) + 1) * 10000;
-
-          APPEND_UINT64_VALUE ("CPUQuotaPerSecUSec", quota);
-          APPEND_UINT64_VALUE ("CPUQuotaPeriodUSec", resources->cpu->period);
-        }
-    }
+  ret = append_cpu_quota (m, missing_properties, resources, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   switch (cgroup_mode)
     {
@@ -1610,13 +1731,17 @@ append_resources (sd_bus_message *m,
         if (UNLIKELY (ret < 0))
           return ret;
 
-        if (resources->cpu && resources->cpu->cpus)
+        if (get_string_from_unified_map (resources, "cpuset.cpus") || (resources->cpu && resources->cpu->cpus))
           {
             const char *property_name = "AllowedCPUs";
+            const char *value = get_string_from_unified_map (resources, "cpuset.cpus");
             cleanup_free char *allowed_cpus = NULL;
             size_t allowed_cpus_len = 0;
 
-            ret = cpuset_string_to_bitmask (resources->cpu->cpus, &allowed_cpus, &allowed_cpus_len, err);
+            if (value == NULL)
+              value = resources->cpu->cpus;
+
+            ret = cpuset_string_to_bitmask (value, &allowed_cpus, &allowed_cpus_len, err);
             if (UNLIKELY (ret < 0))
               return ret;
 
@@ -1628,13 +1753,17 @@ append_resources (sd_bus_message *m,
               }
           }
 
-        if (resources->cpu && resources->cpu->mems)
+        if (get_string_from_unified_map (resources, "cpuset.mems") || (resources->cpu && resources->cpu->mems))
           {
             const char *property_name = "AllowedMemoryNodes";
+            const char *value = get_string_from_unified_map (resources, "cpuset.mems");
             cleanup_free char *allowed_mems = NULL;
             size_t allowed_mems_len = 0;
 
-            ret = cpuset_string_to_bitmask (resources->cpu->mems, &allowed_mems, &allowed_mems_len, err);
+            if (value == NULL)
+              value = resources->cpu->mems;
+
+            ret = cpuset_string_to_bitmask (value, &allowed_mems, &allowed_mems_len, err);
             if (UNLIKELY (ret < 0))
               return ret;
 
@@ -1726,6 +1855,21 @@ verify_ebpf_device_filter_installed (const char *cgroup_path, libcrun_error_t *e
     return crun_make_error (err, 0, "systemd failed to install eBPF device filter on cgroup `%s`", full_path);
 
   return 0;
+}
+
+/* Release the sd-bus objects used by a D-Bus call and return RET.  */
+static int
+cleanup_sd_bus_and_return (sd_bus *bus, sd_bus_message *m, sd_bus_message *reply,
+                           sd_bus_error *error, int ret)
+{
+  if (bus)
+    sd_bus_unref (bus);
+  if (m)
+    sd_bus_message_unref (m);
+  if (reply)
+    sd_bus_message_unref (reply);
+  sd_bus_error_free (error);
+  return ret;
 }
 
 static int
@@ -1932,14 +2076,7 @@ enter_systemd_cgroup_scope (runtime_spec_schema_config_linux_resources *resource
   ret = systemd_check_job_status (bus, &job_data, object, "creating", err);
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
 }
 
 static int
@@ -1998,14 +2135,7 @@ libcrun_destroy_systemd_cgroup_scope (struct libcrun_cgroup_status *cgroup_statu
   reset_failed_unit (bus, scope);
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
 }
 
 static const char *
@@ -2031,6 +2161,7 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
 {
   runtime_spec_schema_config_linux_resources *resources = args->resources;
   const char *cgroup_path = args->cgroup_path;
+  cleanup_free char *scope_path = NULL;
   cleanup_free char *scope = NULL;
   cleanup_free char *path = NULL;
   cleanup_free char *slice = NULL;
@@ -2079,25 +2210,31 @@ libcrun_cgroup_enter_systemd (struct libcrun_cgroup_args *args,
   if (UNLIKELY (ret < 0))
     return ret;
 
-  /* Verify that systemd has actually installed the eBPF device filter if one was requested. */
+  /* Remove the suffix that was added by systemd_finalize.  */
+  if (is_empty_string (suffix))
+    scope_path = xstrdup (path);
+  else
+    {
+      size_t path_len = strlen (path);
+      size_t suffix_len = strlen (suffix);
+
+      scope_path = strndup (path, path_len - suffix_len - 1);
+      if (UNLIKELY (scope_path == NULL))
+        OOM ();
+    }
+
+  /* The cgroup path is chosen by systemd, so it cannot be checked before
+     the container process is moved there.  Check the scope, as the
+     sub-cgroup is created by us, and would appear not frozen even if
+     the scope is.  */
+  ret = libcrun_cgroup_ensure_not_frozen (scope_path, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  /* Verify that systemd has actually installed the eBPF device filter if one was requested.
+     eBPF programs are attached to the systemd scope, not the subgroup.  */
   if (out->bpf_dev_set)
     {
-      cleanup_free char *scope_path = NULL;
-
-      /* eBPF programs are attached to the systemd scope, not the subgroup.
-         Remove the suffix that was added by systemd_finalize. */
-      if (is_empty_string (suffix))
-        scope_path = xstrdup (path);
-      else
-        {
-          size_t path_len = strlen (path);
-          size_t suffix_len = strlen (suffix);
-
-          scope_path = strndup (path, path_len - suffix_len - 1);
-          if (UNLIKELY (scope_path == NULL))
-            OOM ();
-        }
-
       ret = verify_ebpf_device_filter_installed (scope_path, err);
       if (UNLIKELY (ret < 0))
         return ret;
@@ -2116,6 +2253,9 @@ get_cgroup_scope_path (const char *cgroup_path, const char *scope)
 {
   char *path_to_scope = NULL;
   char *cur;
+
+  if (is_empty_string (cgroup_path))
+    return NULL;
 
   path_to_scope = xstrdup (cgroup_path);
 
@@ -2262,14 +2402,54 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
   ret = 0;
 
 exit:
-  if (bus)
-    sd_bus_unref (bus);
-  if (m)
-    sd_bus_message_unref (m);
-  if (reply)
-    sd_bus_message_unref (reply);
-  sd_bus_error_free (&error);
-  return ret;
+  return cleanup_sd_bus_and_return (bus, m, reply, &error, ret);
+}
+
+/* Ask systemd to move PID to PATH, which is either the container scope
+   cgroup or its sub-cgroup.  This works even when the caller has no write
+   access to the cgroup.procs file of the common ancestor of the source and
+   the destination cgroups, as it is the case for a rootless user in a login
+   session, which is outside of user@.service.  */
+static int
+libcrun_attach_process_systemd (struct libcrun_cgroup_status *cgroup_status,
+                                const char *path, pid_t pid,
+                                libcrun_error_t *err)
+{
+  const char *scope = cgroup_status->scope;
+  sd_bus_error error = SD_BUS_ERROR_NULL;
+  cleanup_free char *scope_path = NULL;
+  sd_bus_message *reply = NULL;
+  const char *subcgroup;
+  const char *last;
+  sd_bus *bus = NULL;
+  size_t len;
+  int sd_err, ret;
+
+  if (is_empty_string (scope))
+    return crun_make_error (err, 0, "cannot attach process to cgroup: no systemd scope");
+
+  /* The sub-cgroup is relative to the scope cgroup.  */
+  scope_path = get_cgroup_scope_path (path, scope);
+  if (scope_path == NULL)
+    return crun_make_error (err, 0, "cannot attach process to cgroup: empty path");
+  last = strrchr (scope_path, '/');
+  if (last == NULL || strcmp (last + 1, scope) != 0)
+    return crun_make_error (err, 0, "cannot find scope `%s` in cgroup path `%s`", scope, path);
+  len = strlen (scope_path);
+  subcgroup = path[len] ? path + len : "/";
+
+  ret = open_sd_bus_connection (&bus, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  sd_err = sd_bus_call_method (bus, "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                               "org.freedesktop.systemd1.Manager", "AttachProcessesToUnit",
+                               &error, &reply, "ssau", scope, subcgroup, 1, (uint32_t) pid);
+  if (UNLIKELY (sd_err < 0))
+    ret = crun_make_error (err, sd_bus_error_get_errno (&error), "sd-bus call AttachProcessesToUnit: %s",
+                           error.message ?: error.name);
+
+  return cleanup_sd_bus_and_return (bus, NULL, reply, &error, ret);
 }
 
 #else
@@ -2305,6 +2485,18 @@ libcrun_update_resources_systemd (struct libcrun_cgroup_status *cgroup_status,
 
   return crun_make_error (err, ENOTSUP, "systemd not supported");
 }
+
+static int
+libcrun_attach_process_systemd (struct libcrun_cgroup_status *cgroup_status,
+                                const char *path, pid_t pid,
+                                libcrun_error_t *err)
+{
+  (void) cgroup_status;
+  (void) path;
+  (void) pid;
+
+  return crun_make_error (err, ENOTSUP, "systemd not supported");
+}
 #endif
 
 struct libcrun_cgroup_manager cgroup_manager_systemd = {
@@ -2312,4 +2504,5 @@ struct libcrun_cgroup_manager cgroup_manager_systemd = {
   .create_cgroup = libcrun_cgroup_enter_systemd,
   .destroy_cgroup = libcrun_destroy_cgroup_systemd,
   .update_resources = libcrun_update_resources_systemd,
+  .attach_process = libcrun_attach_process_systemd,
 };

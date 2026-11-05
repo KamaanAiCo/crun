@@ -15,6 +15,20 @@ crun conforms to the OCI Container Runtime specifications
 
 The user documentation is available [here](crun.1.md).
 
+## Releases
+
+Official releases of crun are available on the
+[releases](https://github.com/containers/crun/releases) page.
+
+All release artifacts are signed by one of the keys listed in the
+[`crun.keyring`](crun.keyring) file in the root of this repository.  To
+verify a release artifact:
+
+```console
+$ gpg --no-default-keyring --keyring ./crun.gpg --import crun.keyring
+$ gpg --no-default-keyring --keyring ./crun.gpg --verify crun-1.29.1.tar.zst.asc crun-1.29.1.tar.zst
+```
+
 ## Why another implementation?
 
 While most of the tools used in the Linux containers ecosystem are
@@ -57,9 +71,9 @@ These dependencies are required for the build:
 
 ```console
 $ sudo dnf install -y \
-    autoconf automake gcc git-core glibc-static go-md2man \
+    autoconf automake gcc git-core glibc-static \
     libcap-devel libseccomp-devel libtool make pkg-config \
-    python python-libmount systemd-devel yajl-devel
+    python python-libmount systemd-devel json-c-devel
 ```
 
 ### RHEL/CentOS Stream 9
@@ -67,9 +81,9 @@ $ sudo dnf install -y \
 ```console
 $ sudo dnf config-manager --set-enabled crb
 $ sudo dnf install -y \
-    autoconf automake gcc git-core glibc-static go-md2man \
+    autoconf automake gcc git-core glibc-static \
     libcap-devel libseccomp-devel libtool make pkg-config \
-    python python-libmount systemd-devel yajl-devel
+    python python-libmount systemd-devel json-c-devel
 ```
 
 ### RHEL/CentOS Stream 10
@@ -77,33 +91,31 @@ $ sudo dnf install -y \
 ```console
 $ sudo dnf config-manager --set-enabled crb
 $ sudo dnf install -y \
-    autoconf automake gcc git-core glibc-static go-md2man \
+    autoconf automake gcc git-core glibc-static \
     libcap-devel libseccomp-devel libtool make pkg-config \
     python python-libmount systemd-devel
 ```
-
-NOTE that you need to add `--enable-embedded-yajl` to `./configure` flags below.
 
 ### Ubuntu
 
 ```console
 $ sudo apt-get install -y make git gcc build-essential pkgconf libtool \
-   libsystemd-dev libprotobuf-c-dev libcap-dev libseccomp-dev libyajl-dev \
-   go-md2man autoconf python3 automake
+   libsystemd-dev libprotobuf-c-dev libcap-dev libseccomp-dev libjson-c-dev \
+   autoconf python3 automake
 ```
 
 ### Alpine
 
 ```console
 # apk add gcc automake autoconf libtool gettext pkgconf git make musl-dev \
-    python3 libcap-dev libseccomp-dev yajl-dev argp-standalone go-md2man
+    python3 libcap-dev libseccomp-dev json-c-dev argp-standalone
 ```
 
 ### Tumbleweed
 
 ```console
 # zypper install make automake autoconf gettext libtool gcc libcap-devel \
-systemd-devel libyajl-devel libseccomp-devel python3 go-md2man \
+systemd-devel libjson-c-devel libseccomp-devel python3 \
 glibc-static;
 ```
 
@@ -156,7 +168,7 @@ To build the binaries by locally installing the nix package manager:
 ```console
 $ curl -L https://nixos.org/nix/install | sh
 $ git clone --recursive https://github.com/containers/crun.git && cd crun
-$ nix build -f nix/
+$ nix --extra-experimental-features "nix-command flakes" build "path:.#crun-static-amd64"
 $ ./result/bin/crun --version
 ```
 

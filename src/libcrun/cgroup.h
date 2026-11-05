@@ -26,8 +26,12 @@
 #  define CGROUP_ROOT "/sys/fs/cgroup"
 #endif
 
+#ifndef SELF_CGROUP
+#  define SELF_CGROUP "self/cgroup"
+#endif
+
 #ifndef PROC_SELF_CGROUP
-#  define PROC_SELF_CGROUP "/proc/self/cgroup"
+#  define PROC_SELF_CGROUP "/proc/" SELF_CGROUP
 #endif
 
 enum
@@ -57,6 +61,9 @@ struct libcrun_cgroup_args
   gid_t root_gid;
   const char *id;
   bool joined;
+  /* The path of the cgroup created by libcrun_cgroup_preenter, when there
+     is no status for it yet.  */
+  char *precreated_path;
 
   const char *state_root;
   libcrun_container_t *container;
@@ -64,6 +71,7 @@ struct libcrun_cgroup_args
 
 /* cgroup life-cycle management.  */
 int libcrun_cgroup_preenter (struct libcrun_cgroup_args *args, int *dirfd, libcrun_error_t *err);
+void libcrun_cgroup_preenter_cleanup (struct libcrun_cgroup_args *args);
 int libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status **out, libcrun_error_t *err);
 int libcrun_cgroup_enter_finalize (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
 int libcrun_cgroup_destroy (struct libcrun_cgroup_status *cgroup_status, libcrun_error_t *err);
@@ -83,6 +91,7 @@ cgroup_status_freep (struct libcrun_cgroup_status **p)
     libcrun_cgroup_status_free (s);
 }
 #define cleanup_cgroup_status __attribute__ ((cleanup (cgroup_status_freep)))
+#define cleanup_cgroup_preenter __attribute__ ((cleanup (libcrun_cgroup_preenter_cleanup)))
 
 /* Operations on the cgroup.  */
 
@@ -98,6 +107,11 @@ int libcrun_update_cgroup_resources (struct libcrun_cgroup_status *status,
                                      libcrun_error_t *err);
 
 int libcrun_cgroup_is_container_paused (struct libcrun_cgroup_status *status, bool *paused, libcrun_error_t *err);
+
+/* Move PID to the cgroup PATH, which is the container cgroup described by STATUS
+   or its sub-cgroup.  */
+int libcrun_cgroup_join_process (struct libcrun_cgroup_status *status, const char *path, pid_t pid, pid_t init_pid,
+                                 libcrun_error_t *err);
 
 int libcrun_cgroup_pause_unpause (struct libcrun_cgroup_status *status, const bool pause, libcrun_error_t *err);
 

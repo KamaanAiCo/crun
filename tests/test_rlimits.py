@@ -16,6 +16,7 @@
 # along with crun.  If not, see <http://www.gnu.org/licenses/>.
 
 import sys
+import subprocess
 from tests_utils import *
 
 def parse_proc_limits(content):
@@ -57,12 +58,36 @@ def test_rlimits():
     for v in rlimits:
         limit = limits.get(v['type'])
         if str(limit[1]) != str(v['soft']) or str(limit[2]) != str(v['hard']):
-            logger.info("%s: %s %s", key, soft_limit, hard_limit)
+            logger.info("%s: got %s %s, expected %s %s", v['type'], limit[1], limit[2], v['soft'], v['hard'])
             return -1
     return 0
 
+def test_rlimits_duplicate():
+    if is_rootless():
+        return (77, "requires root privileges")
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'echo', 'hello']
+    rlimits = [
+        {"type" : "RLIMIT_NOFILE",
+         "soft" : 32,
+         "hard" : 64},
+        {"type" : "RLIMIT_NOFILE",
+         "soft" : 48,
+         "hard" : 64},
+    ]
+    conf['process']['rlimits'] = rlimits
+    add_all_namespaces(conf)
+    try:
+        run_and_get_output(conf, hide_stderr=False)
+    except subprocess.CalledProcessError as e:
+        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
+        if "duplicate rlimit" in output:
+            return 0
+    return -1
+
 all_tests = {
     "rlimits" : test_rlimits,
+    "rlimits-duplicate" : test_rlimits_duplicate,
 }
 
 if __name__ == "__main__":

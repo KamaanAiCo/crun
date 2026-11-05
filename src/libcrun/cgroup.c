@@ -117,7 +117,7 @@ libcrun_cgroup_is_container_paused (struct libcrun_cgroup_status *status, bool *
   int cgroup_mode;
   int ret;
 
-  if (cgroup_path == NULL || cgroup_path[0] == '\0')
+  if (cgroup_path == NULL)
     return 0;
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
@@ -184,6 +184,46 @@ libcrun_cgroup_is_container_paused (struct libcrun_cgroup_status *status, bool *
 }
 
 int
+libcrun_cgroup_join_process (struct libcrun_cgroup_status *status, const char *path, pid_t pid, pid_t init_pid,
+                             libcrun_error_t *err)
+{
+  struct libcrun_cgroup_manager *cgroup_manager;
+  libcrun_error_t tmp_err = NULL;
+  int errno_;
+  int ret;
+
+  ret = libcrun_move_process_to_cgroup (pid, init_pid, path, false, err);
+  if (LIKELY (ret >= 0))
+    return ret;
+
+  /* Moving a process requires write access to cgroup.procs of the common
+     ancestor of the source and the destination cgroups, which the caller
+     may lack.  See if the cgroup manager can do it instead.  */
+  errno_ = crun_error_get_errno (err);
+  if (errno_ != EACCES && errno_ != EPERM)
+    return ret;
+
+  if (get_cgroup_manager (status->manager, &cgroup_manager, &tmp_err) < 0)
+    {
+      crun_error_release (&tmp_err);
+      return ret;
+    }
+  if (cgroup_manager->attach_process == NULL)
+    return ret;
+
+  if (UNLIKELY (cgroup_manager->attach_process (status, path, pid, &tmp_err) < 0))
+    {
+      /* Report the original error, as it is more relevant.  */
+      libcrun_debug ("Cannot attach pid %d to cgroup `%s`: %s", pid, path, tmp_err->msg);
+      crun_error_release (&tmp_err);
+      return ret;
+    }
+
+  crun_error_release (err);
+  return 0;
+}
+
+int
 libcrun_cgroup_read_pids (struct libcrun_cgroup_status *status, bool recurse, pid_t **pids, libcrun_error_t *err)
 {
   return libcrun_cgroup_read_pids_from_path (status->path, recurse, pids, err);
@@ -208,6 +248,64 @@ libcrun_cgroup_destroy (struct libcrun_cgroup_status *cgroup_status, libcrun_err
   return cgroup_manager->destroy_cgroup (cgroup_status, err);
 }
 
+/* On cgroup v2, the CPU quota and period are set together, via cpu.max.
+   If an update sets only one of them, take the other one from the current
+   cpu.max, so it is kept (rather than reset to the default).  */
+static int
+complete_cpu_max (const char *path, runtime_spec_schema_config_linux_resources *resources, libcrun_error_t *err)
+{
+  runtime_spec_schema_config_linux_resources_cpu *cpu;
+  cleanup_free char *cpu_max_path = NULL;
+  cleanup_free char *content = NULL;
+  bool has_period;
+  uint64_t period;
+  int64_t quota;
+  int cgroup_mode;
+  int ret;
+
+  if (resources == NULL || resources->cpu == NULL)
+    return 0;
+
+  cpu = resources->cpu;
+  if (cpu->quota_present == cpu->period_present)
+    return 0;
+
+  cgroup_mode = libcrun_get_cgroup_mode (err);
+  if (UNLIKELY (cgroup_mode < 0))
+    return cgroup_mode;
+  if (cgroup_mode != CGROUP_MODE_UNIFIED)
+    return 0;
+
+  ret = append_paths (&cpu_max_path, err, CGROUP_ROOT, path, "cpu.max", NULL);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = read_all_file (cpu_max_path, &content, NULL, err);
+  if (UNLIKELY (ret < 0))
+    {
+      /* The cpu controller might not be enabled; nothing to keep then.  */
+      crun_error_release (err);
+      return 0;
+    }
+
+  ret = parse_cpu_max (content, &quota, &period, &has_period, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (! cpu->quota_present)
+    {
+      cpu->quota = quota;
+      cpu->quota_present = 1;
+    }
+  else if (has_period)
+    {
+      cpu->period = period;
+      cpu->period_present = 1;
+    }
+
+  return 0;
+}
+
 int
 libcrun_update_cgroup_resources (struct libcrun_cgroup_status *cgroup_status,
                                  const char *state_root,
@@ -218,6 +316,14 @@ libcrun_update_cgroup_resources (struct libcrun_cgroup_status *cgroup_status,
   int ret;
 
   ret = get_cgroup_manager (cgroup_status->manager, &cgroup_manager, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = check_memory_before_update (cgroup_status->path, resources, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = complete_cpu_max (cgroup_status->path, resources, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -285,6 +391,21 @@ libcrun_cgroup_preenter (struct libcrun_cgroup_args *args, int *dirfd, libcrun_e
   return cgroup_manager->precreate_cgroup (args, dirfd, err);
 }
 
+/* Remove the cgroup created by libcrun_cgroup_preenter if libcrun_cgroup_enter
+   did not take it over: until then the caller has no status to destroy it with.
+   Being created by us and without any process joining it, it is empty and a
+   plain rmdir is enough.  */
+void
+libcrun_cgroup_preenter_cleanup (struct libcrun_cgroup_args *args)
+{
+  if (args->precreated_path == NULL)
+    return;
+
+  (void) rmdir (args->precreated_path);
+  free (args->precreated_path);
+  args->precreated_path = NULL;
+}
+
 int
 libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_status **out, libcrun_error_t *err)
 {
@@ -350,6 +471,10 @@ libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_st
       return ret;
     }
 
+  /* From now on the cgroup is destroyed through its status.  */
+  free (args->precreated_path);
+  args->precreated_path = NULL;
+
   if (status->path)
     {
       bool need_chown;
@@ -359,20 +484,31 @@ libcrun_cgroup_enter (struct libcrun_cgroup_args *args, struct libcrun_cgroup_st
         {
           ret = chown_cgroups (status->path, root_uid, root_gid, err);
           if (UNLIKELY (ret < 0))
-            return ret;
+            goto fail_destroy;
         }
 
       if (args->resources)
         {
           ret = update_cgroup_resources (status->path, args->state_root, args->resources, ! status->bpf_dev_set, err);
           if (UNLIKELY (ret < 0))
-            return ret;
+            goto fail_destroy;
         }
     }
 success:
   *out = status;
   status = NULL;
   return 0;
+
+fail_destroy:
+  /* The cgroup is created, but the caller does not get its status, so it
+     cannot destroy it.  Do it here, so it is not left behind.  */
+  {
+    libcrun_error_t tmp_err = NULL;
+
+    if (UNLIKELY (cgroup_manager->destroy_cgroup (status, &tmp_err) < 0))
+      crun_error_release (&tmp_err);
+  }
+  return ret;
 }
 
 int
@@ -389,6 +525,9 @@ libcrun_cgroup_enter_finalize (struct libcrun_cgroup_args *args, struct libcrun_
   delegate_cgroup = find_delegate_cgroup (args->annotations);
   if (delegate_cgroup == NULL)
     return 0;
+
+  if (path_has_dot_dot_component (delegate_cgroup))
+    return crun_make_error (err, 0, "invalid `..` component in delegate-cgroup `%s`", delegate_cgroup);
 
   cgroup_mode = libcrun_get_cgroup_mode (err);
   if (UNLIKELY (cgroup_mode < 0))
@@ -555,10 +694,10 @@ libcrun_cgroup_make_status (libcrun_container_status_t *status)
 
   ret = xmalloc0 (sizeof *ret);
 
-  if (status->cgroup_path)
+  if (! is_empty_string (status->cgroup_path))
     ret->path = xstrdup (status->cgroup_path);
 
-  if (status->scope)
+  if (! is_empty_string (status->scope))
     ret->scope = xstrdup (status->scope);
 
   if (is_empty_string (status->cgroup_path) && is_empty_string (status->scope))

@@ -2,6 +2,10 @@ DIST_SUBDIRS = libocispec
 SUBDIRS = libocispec
 ACLOCAL_AMFLAGS = -I m4
 
+# The warning flags detected by configure.  automake puts AM_CFLAGS before
+# CFLAGS, so the user can still override any of them.
+AM_CFLAGS = $(WARN_CFLAGS)
+
 WD := $(shell pwd)
 # outdir is needed by the make_srpm build type on Fedora copr
 # https://docs.pagure.org/copr.copr/user_documentation.html#make-srpm
@@ -32,15 +36,11 @@ else
 noinst_LTLIBRARIES = libcrun.la
 endif
 
-if BUILD_TESTS
 check_LTLIBRARIES = libcrun_testing.la
-endif
 
 libcrun_SOURCES = src/libcrun/utils.c \
 		src/libcrun/string_map.c \
 		src/libcrun/ring_buffer.c \
-		src/libcrun/blake3/blake3.c \
-		src/libcrun/blake3/blake3_portable.c \
 		src/libcrun/cgroup-cgroupfs.c \
 		src/libcrun/cgroup-resources.c \
 		src/libcrun/cgroup-setup.c \
@@ -71,52 +71,57 @@ libcrun_SOURCES = src/libcrun/utils.c \
 		src/libcrun/seccomp.c \
 		src/libcrun/seccomp_notify.c \
 		src/libcrun/signals.c \
+		src/libcrun/spec.c \
 		src/libcrun/status.c \
 		src/libcrun/net_device.c \
 		src/libcrun/terminal.c
 
-if HAVE_EMBEDDED_YAJL
-maybe_libyajl.la = libocispec/yajl/libyajl.la
-else
-maybe_libyajl.la =
-endif
 
 libocispec/libocispec.la:
 	$(MAKE) $(AM_MAKEFLAGS) -C libocispec libocispec.la
 
+if HAVE_EMBEDDED_BLAKE3
+libcrun_SOURCES += src/libcrun/blake3/blake3.c \
+		src/libcrun/blake3/blake3_portable.c
+endif
+
 libcrun_la_SOURCES = $(libcrun_SOURCES)
-libcrun_la_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -fvisibility=hidden
+libcrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=hidden -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 libcrun_la_CFLAGS += $(COVERAGE_CFLAGS)
-libcrun_la_LDFLAGS = -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(COVERAGE_LDFLAGS)
+libcrun_la_LDFLAGS = -version-info 1:0:0 -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
 else
-libcrun_la_LDFLAGS = -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds
+libcrun_la_LDFLAGS = -version-info 1:0:0 -Wl,--version-script=$(abs_top_srcdir)/libcrun.lds $(SANITIZER_LDFLAGS)
 endif
-libcrun_la_LIBADD = libocispec/libocispec.la $(FOUND_LIBS) $(maybe_libyajl.la)
+
+if ENABLE_LIBCRUN
+include_HEADERS = src/libcrun/libcrun.h
+endif
+libcrun_la_LIBADD = libocispec/libocispec.la $(FOUND_LIBS) $(JSON_C_LIBS)
 
 # build a version with all the symbols visible for testing
-if BUILD_TESTS
 libcrun_testing_la_SOURCES = $(libcrun_SOURCES)
-libcrun_testing_la_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -fvisibility=default
+libcrun_testing_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -fvisibility=default -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 libcrun_testing_la_CFLAGS += $(COVERAGE_CFLAGS)
-libcrun_testing_la_LDFLAGS = $(COVERAGE_LDFLAGS)
+libcrun_testing_la_LDFLAGS = $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
+else
+libcrun_testing_la_LDFLAGS = $(SANITIZER_LDFLAGS)
 endif
-libcrun_testing_la_LIBADD = libocispec/libocispec.la $(maybe_libyajl.la)
-endif
+libcrun_testing_la_LIBADD = libocispec/libocispec.la $(JSON_C_LIBS)
 
 if PYTHON_BINDINGS
 pyexec_LTLIBRARIES = python_crun.la
 python_crun_la_SOURCES = python/crun_python.c
-python_crun_la_CFLAGS = -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/libocispec/src -I $(abs_top_builddir)/src $(PYTHON_CFLAGS)
+python_crun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src $(PYTHON_CFLAGS)
 python_crun_la_LDFLAGS = -avoid-version -module $(PYTHON_LDFLAGS)
-python_crun_la_LIBADD = libcrun.la $(PYTHON_LIBS) $(FOUND_LIBS) $(maybe_libyajl.la)
+python_crun_la_LIBADD = libcrun.la $(PYTHON_LIBS) $(FOUND_LIBS) $(JSON_C_LIBS)
 endif
 
 if LUA_BINDINGS
 luaexec_LTLIBRARIES = luacrun.la
 luacrun_la_SOURCES = lua/lua_crun.c
-luacrun_la_CFLAGS = -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/libocispec/src -I $(abs_top_builddir)/src $(LUA_INCLUDE)
+luacrun_la_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src $(LUA_INCLUDE)
 luacrun_la_LDFLAGS = -avoid-version -module
 luacrun_la_LIBADD = libcrun.la $(LUA_LIB) $(FOUND_LIBS)
 
@@ -145,7 +150,11 @@ dist-luarock: $(LUACRUN_ROCK)
 
 endif
 
-crun_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\""
+# The crun binary is a pure consumer of the public libcrun API: it includes
+# only <libcrun.h> and links dynamically against libcrun.so.  It therefore
+# does NOT get the libocispec/json-c include paths -- if a binary source file
+# ever reaches for an internal header the build breaks, which is intentional.
+crun_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_srcdir)/src -D CRUN_LIBDIR="\"$(CRUN_LIBDIR)\"" $(SANITIZER_CFLAGS)
 if ENABLE_COVERAGE
 crun_CFLAGS += $(COVERAGE_CFLAGS)
 endif
@@ -155,22 +164,28 @@ crun_SOURCES = src/crun.c src/run.c src/delete.c src/kill.c src/pause.c src/unpa
 
 if DYNLOAD_LIBCRUN
 if ENABLE_COVERAGE
-crun_LDFLAGS = -Wl,--unresolved-symbols=ignore-all $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS)
+crun_LDFLAGS = -Wl,--unresolved-symbols=ignore-all $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
 else
-crun_LDFLAGS = -Wl,--unresolved-symbols=ignore-all $(CRUN_LDFLAGS)
+crun_LDFLAGS = -Wl,--unresolved-symbols=ignore-all $(CRUN_LDFLAGS) $(SANITIZER_LDFLAGS)
 endif
 else
-crun_LDADD = libcrun.la $(FOUND_LIBS) $(maybe_libyajl.la)
+# The crun binary links dynamically against libcrun; it resolves 100% of its
+# libcrun symbols from the public API exported by libcrun.lds.  There is no
+# -static-libtool-libs smuggling: if a binary source file reaches for a symbol
+# that is not part of the public API, the dynamic link fails, which is
+# intentional.  It links only against libcrun (no direct libocispec/json-c/
+# system deps): those are transitively provided by libcrun.so.
+crun_LDADD = libcrun.la
 if ENABLE_COVERAGE
-crun_LDFLAGS = $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS)
+crun_LDFLAGS = -Wl,--as-needed $(CRUN_LDFLAGS) $(COVERAGE_LDFLAGS) $(SANITIZER_LDFLAGS)
 else
-crun_LDFLAGS = $(CRUN_LDFLAGS)
+crun_LDFLAGS = -Wl,--as-needed $(CRUN_LDFLAGS) $(SANITIZER_LDFLAGS)
 endif
 endif
 
-EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md rpm/crun.spec autogen.sh \
+EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md THREAT_MODEL.md crun.keyring rpm/crun.spec autogen.sh \
 	src/libcrun/blake3/blake3_impl.h src/libcrun/blake3/blake3.h \
-	src/crun.h src/list.h src/run.h src/run_create.h src/delete.h src/kill.h src/pause.h src/unpause.h \
+	src/crun.h src/crun_utils.h src/list.h src/run.h src/run_create.h src/delete.h src/kill.h src/pause.h src/unpause.h \
 	src/create.h src/start.h src/state.h src/exec.h src/oci_features.h src/spec.h src/update.h src/ps.h src/mounts.h \
 	src/checkpoint.h src/restore.h src/libcrun/seccomp_notify.h src/libcrun/seccomp_notify_plugin.h \
 	src/libcrun/container.h src/libcrun/seccomp.h src/libcrun/ebpf.h \
@@ -183,15 +198,20 @@ EXTRA_DIST = COPYING COPYING.libcrun README.md NEWS SECURITY.md rpm/crun.spec au
 	src/libcrun/linux.h src/libcrun/utils.h src/libcrun/error.h src/libcrun/criu.h \
 	src/libcrun/scheduler.h src/libcrun/mempolicy.h src/libcrun/status.h src/libcrun/terminal.h \
 	src/libcrun/mount_flags.h src/libcrun/intelrdt.h src/libcrun/ring_buffer.h src/libcrun/string_map.h \
-	src/libcrun/net_device.h \
+	src/libcrun/json_gen_utils.h \
+	src/libcrun/net_device.h src/libcrun/spec.h \
 	src/libcrun/syscalls.h \
 	crun.1.md crun.1 libcrun.lds \
 	krun.1.md krun.1 \
-	lua/luacrun.rockspec
+	lua/luacrun.rockspec lua/test_lua_bindings.lua \
+	python/test_python_bindings.py
 
-if BUILD_TESTS
-UNIT_TESTS = tests/tests_libcrun_utils tests/tests_libcrun_ring_buffer tests/tests_libcrun_errors tests/tests_libcrun_intelrdt tests/tests_libcrun_terminal tests/tests_libcrun_custom_handler tests/tests_libcrun_linux tests/tests_libcrun_signals tests/tests_libcrun_mount_flags tests/tests_libcrun_chroot_realpath tests/tests_libcrun_seccomp_notify tests/tests_libcrun_cgroup
+if !HAVE_EMBEDDED_BLAKE3
+EXTRA_DIST += src/libcrun/blake3/blake3.c \
+		src/libcrun/blake3/blake3_portable.c
 endif
+
+UNIT_TESTS = tests/tests_libcrun_utils tests/tests_libcrun_ring_buffer tests/tests_libcrun_errors tests/tests_libcrun_intelrdt tests/tests_libcrun_terminal tests/tests_libcrun_custom_handler tests/tests_libcrun_linux tests/tests_libcrun_signals tests/tests_libcrun_mount_flags tests/tests_libcrun_chroot_realpath tests/tests_libcrun_seccomp_notify tests/tests_libcrun_cgroup
 
 if ENABLE_CRUN
 bin_PROGRAMS = crun
@@ -200,84 +220,99 @@ else
 noinst_PROGRAMS = crun
 endif
 
-if BUILD_TESTS
-check_PROGRAMS = tests/init $(UNIT_TESTS) tests/tests_libcrun_fuzzer
+check_PROGRAMS = $(UNIT_TESTS) tests/tests_libcrun_fuzzer tests/no_openat2
 
-TESTS_LDADD = libcrun_testing.la $(FOUND_LIBS) $(maybe_libyajl.la)
+# tests/init is the container init the python tests run; it is the one thing
+# here that has to be linked statically.
+if BUILD_STATIC_TESTS
+check_PROGRAMS += tests/init
+endif
+
+TESTS_LDADD = libcrun_testing.la $(FOUND_LIBS) $(JSON_C_LIBS)
 
 tests_init_LDADD =
 tests_init_LDFLAGS = -static-libgcc -all-static
-tests_init_CFLAGS = -g -O2
+tests_init_CFLAGS = $(WARN_CFLAGS) -g -O2
 tests_init_SOURCES = tests/init.c
 
-tests_tests_libcrun_utils_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_no_openat2_LDADD =
+tests_no_openat2_CFLAGS = $(WARN_CFLAGS) -g -O2
+tests_no_openat2_SOURCES = tests/no_openat2.c
+
+tests_tests_libcrun_utils_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_utils_SOURCES = tests/tests_libcrun_utils.c
 tests_tests_libcrun_utils_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_utils_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_ring_buffer_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_ring_buffer_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_ring_buffer_SOURCES = tests/tests_libcrun_ring_buffer.c
 tests_tests_libcrun_ring_buffer_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_ring_buffer_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_intelrdt_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_intelrdt_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_intelrdt_SOURCES = tests/tests_libcrun_intelrdt.c
 tests_tests_libcrun_intelrdt_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_intelrdt_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_fuzzer_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_fuzzer_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_fuzzer_SOURCES = tests/tests_libcrun_fuzzer.c
-tests_tests_libcrun_fuzzer_LDADD = $(TESTS_LDADD) libocispec/libocispec.la $(maybe_libyajl.la)
+tests_tests_libcrun_fuzzer_LDADD = $(TESTS_LDADD) libocispec/libocispec.la $(JSON_C_LIBS)
 tests_tests_libcrun_fuzzer_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_errors_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_errors_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_errors_SOURCES = tests/tests_libcrun_errors.c
 tests_tests_libcrun_errors_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_errors_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_terminal_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_terminal_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_terminal_SOURCES = tests/tests_libcrun_terminal.c
 tests_tests_libcrun_terminal_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_terminal_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_custom_handler_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_custom_handler_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_custom_handler_SOURCES = tests/tests_libcrun_custom_handler.c
 tests_tests_libcrun_custom_handler_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_custom_handler_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_linux_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_linux_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_linux_SOURCES = tests/tests_libcrun_linux.c
 tests_tests_libcrun_linux_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_linux_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_signals_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_signals_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_signals_SOURCES = tests/tests_libcrun_signals.c
 tests_tests_libcrun_signals_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_signals_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_mount_flags_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_mount_flags_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_mount_flags_SOURCES = tests/tests_libcrun_mount_flags.c
 tests_tests_libcrun_mount_flags_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_mount_flags_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_chroot_realpath_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_chroot_realpath_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_chroot_realpath_SOURCES = tests/tests_libcrun_chroot_realpath.c
 tests_tests_libcrun_chroot_realpath_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_chroot_realpath_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_seccomp_notify_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_seccomp_notify_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_seccomp_notify_SOURCES = tests/tests_libcrun_seccomp_notify.c
 tests_tests_libcrun_seccomp_notify_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_seccomp_notify_LDFLAGS = $(crun_LDFLAGS)
 
-tests_tests_libcrun_cgroup_CFLAGS = -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
+tests_tests_libcrun_cgroup_CFLAGS = $(WARN_CFLAGS) -I $(abs_top_builddir)/libocispec/src -I $(abs_top_srcdir)/libocispec/src $(JSON_C_CFLAGS) -I $(abs_top_builddir)/src -I $(abs_top_srcdir)/src
 tests_tests_libcrun_cgroup_SOURCES = tests/tests_libcrun_cgroup.c
 tests_tests_libcrun_cgroup_LDADD = $(TESTS_LDADD)
 tests_tests_libcrun_cgroup_LDFLAGS = $(crun_LDFLAGS)
 
-endif
 TEST_EXTENSIONS = .py
 PY_LOG_COMPILER = $(PYTHON)
+
+# The cgroup manager the Python tests tell crun to use.  Override it on the
+# command line to exercise a different backend, e.g. "make check
+# CGROUP_MANAGER=systemd" (see the check-systemd target below).
+CGROUP_MANAGER = cgroupfs
+AM_TESTS_ENVIRONMENT = CGROUP_MANAGER='$(CGROUP_MANAGER)'; export CGROUP_MANAGER;
+
 PY_LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) $(top_srcdir)/build-aux/tap-driver.sh
 LOG_DRIVER = env AM_TAP_AWK='$(AWK)' $(SHELL) $(top_srcdir)/build-aux/tap-driver.sh
 
@@ -287,6 +322,7 @@ PYTHON_TESTS = tests/test_capabilities.py \
 	tests/test_devices.py \
 	tests/test_hostname.py \
 	tests/test_domainname.py \
+	tests/test_sysctl.py \
 	tests/test_limits.py \
 	tests/test_oci_features.py \
 	tests/test_mempolicy.py \
@@ -320,32 +356,54 @@ PYTHON_TESTS = tests/test_capabilities.py \
 	tests/test_net_device.py \
 	tests/test_cgroup_resources.py \
 	tests/test_error_handling.py \
+	tests/test_null_config_values.py \
 	tests/test_custom_handler.py
 
-if BUILD_TESTS
+if BUILD_STATIC_TESTS
 TESTS = $(PYTHON_TESTS) $(UNIT_TESTS)
+else
+# Without tests/init the python tests cannot run; the unit tests still can.
+TESTS = $(UNIT_TESTS)
 endif
+
+# Run the whole test suite with openat2(2) forced to fail with ENOSYS.  This
+# exercises the safe_openat() fallback used on kernels older than 5.6 and
+# wherever a seccomp filter blocks openat2, which is otherwise never reached
+# on a modern kernel.  Run it as root: without CAP_SYS_ADMIN the helper must
+# set NO_NEW_PRIVS, which the test containers inherit.
+check-no-openat2: tests/no_openat2$(EXEEXT)
+	$(MAKE) $(AM_MAKEFLAGS) check TESTS_ENVIRONMENT='$(abs_top_builddir)/tests/no_openat2$(EXEEXT)'
+
+# Run the whole test suite with the systemd cgroup manager.  The tests already
+# know which of them are specific to one manager or the other, but without this
+# they only ever run with the cgroupfs one.
+check-systemd:
+	$(MAKE) $(AM_MAKEFLAGS) check CGROUP_MANAGER=systemd
 
 .version:
 	$(AM_V_GEN)echo $(VERSION) > $@-t && mv $@-t $@
 
-git-version.h:
+git-version.h: FORCE
 	@if test -e $(abs_top_srcdir)/.tarball-git-version.h; then \
-		cp $(abs_top_srcdir)/.tarball-git-version.h $@; \
+		cp $(abs_top_srcdir)/.tarball-git-version.h $@-t || { rm -f $@-t; exit 1; }; \
 	elif test -e $(abs_top_srcdir)/.git; then \
 		version=`$(AM__GEN)git --git-dir=$(abs_top_srcdir)/.git rev-parse HEAD`; \
-		$(AM__GEN)printf "/* autogenerated.  */\n#ifndef GIT_VERSION\n# define GIT_VERSION \"%s\"\n#endif\n" $$version > $@-t && mv $@-t $@; \
+		$(AM__GEN)printf "/* autogenerated.  */\n#ifndef GIT_VERSION\n# define GIT_VERSION \"%s\"\n#endif\n" $$version > $@-t || { rm -f $@-t; exit 1; }; \
+	fi; \
+	if test -e $@-t; then \
+		if cmp -s $@-t $@; then rm -f $@-t; else mv $@-t $@; fi; \
 	fi
 
+FORCE:
+
 nixpkgs:
-	@nix --extra-experimental-features nix-command run -f channel:nixpkgs-unstable nix-prefetch-git -- \
-		--no-deepClone https://github.com/nixos/nixpkgs > nix/nixpkgs.json
+	@nix --extra-experimental-features "nix-command flakes" flake update
 
 dist-hook:
 	$(AM_V_GEN)echo $(VERSION) > $(distdir)/.tarball-version
 	$(AM__GEN)cp git-version.h $(distdir)/.tarball-git-version.h
 
-EXTRA_DIST += $(PYTHON_TESTS) tests/run_all_tests.sh tests/tests_utils.py build-aux/git-version-gen src/libcrun/signals.perf src/libcrun/mount_flags.perf
+EXTRA_DIST += $(PYTHON_TESTS) tests/run_rootless_systemd.sh tests/tests_utils.py tests/tap.h build-aux/git-version-gen src/libcrun/signals.perf src/libcrun/mount_flags.perf
 BUILT_SOURCES = .version git-version.h
 
 CLEANFILES = crun.spec .version git-version.h $(LUACRUN_ROCKSPEC)
@@ -359,16 +417,6 @@ endif
 if ENABLE_KRUN
 man1_MANS += krun.1
 endif
-
-crun.1: $(abs_srcdir)/crun.1.md
-if HAVE_MD2MAN
-	$(MD2MAN) -in $(abs_srcdir)/crun.1.md -out crun.1
-endif HAVE_MD2MAN
-
-krun.1: $(abs_srcdir)/krun.1.md
-if HAVE_MD2MAN
-	$(MD2MAN) -in $(abs_srcdir)/krun.1.md -out krun.1
-endif HAVE_MD2MAN
 
 install-exec-hook:
 if ENABLE_KRUN
@@ -386,7 +434,11 @@ if ENABLE_WASM
 	rm -f $(DESTDIR)$(bindir)/crun-wasm$(EXEEXT)
 endif
 
-generate-man: crun.1 krun.1
+MD2MAN = go-md2man
+
+generate-man:
+	$(MD2MAN) -in $(srcdir)/crun.1.md -out $(srcdir)/crun.1
+	$(MD2MAN) -in $(srcdir)/krun.1.md -out $(srcdir)/krun.1
 
 sync:
 	(cd libocispec; git pull https://github.com/containers/libocispec main)
@@ -395,8 +447,8 @@ coverity:
 	$(MAKE) $(AM_MAKEFLAGS) -C libocispec
 	$(MAKE) $(AM_MAKEFLAGS) crun
 
-libcrun.rs: src/libcrun/container.h
-	bindgen src/libcrun/container.h -- -I$(abs_builddir) -I$(abs_builddir)/libocispec/src  > $@
+libcrun.rs: src/libcrun/libcrun.h
+	bindgen src/libcrun/libcrun.h -- -I$(abs_top_srcdir)/src  > $@
 
 generate-rust-bindings: libcrun.rs
 
@@ -407,11 +459,35 @@ generate-mount_flags.c: src/libcrun/mount_flags.perf
 	${GPERF} --lookup-function-name libcrun_mount_flag_in_word_set -m 100 -tCEG -S1 $< > src/libcrun/mount_flags.c
 
 clang-format:
-# do not format files that were copied into the source directory.
-	git ls-files contrib src tests | grep -E "\\.[hc]" | grep -v "blake3\|chroot_realpath.c\|cloned_binary.c\|signals.c\|mount_flags.c" | xargs clang-format -style=file -i
+	$(srcdir)/build-aux/c-files.sh clang-format -style=file -i
 
 shellcheck:
-	shellcheck autogen.sh build-aux/release.sh tests/run_all_tests.sh tests/*/*.sh contrib/*.sh
+	$(srcdir)/build-aux/sh-files.sh shellcheck
+
+validate-keyring:
+	$(srcdir)/build-aux/keyring_validate.sh
+
+shfmt:
+	$(srcdir)/build-aux/sh-files.sh shfmt -w
+
+# Static analysis with cppcheck.  Files copied into the source tree are not
+# analyzed.  varFuncNullUB is suppressed since a bare NULL is used as the
+# sentinel of the variadic helpers, and __has_attribute() is defined since
+# cppcheck cannot evaluate it.  __builtin_expect() is reduced to its first
+# argument because cppcheck 2.22 loses track of the value of a condition
+# wrapped into it, reporting bogus null pointer dereferences after a
+# LIKELY()/UNLIKELY() guard.
+CPPCHECK_FLAGS = \
+	--quiet --force --inline-suppr --error-exitcode=1 \
+	--enable=warning,performance,portability \
+	--suppress=varFuncNullUB \
+	-D__has_attribute\(x\)=0 \
+	'-D__builtin_expect(x,y)=(x)' \
+	-i $(srcdir)/src/libcrun/blake3 \
+	-I $(builddir) -I $(srcdir)/src -I $(srcdir)/libocispec/src -I $(srcdir)/libocispec
+
+cppcheck:
+	cppcheck $(CPPCHECK_FLAGS) $(srcdir)/src $(srcdir)/tests/*.c $(srcdir)/contrib/*.c
 
 # Code coverage targets
 if ENABLE_COVERAGE
@@ -523,4 +599,4 @@ clean-local: coverage-clean
 # Coverage targets must not run in parallel due to race conditions in .gcda file writes
 .NOTPARALLEL: coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env
 
-.PHONY: coverity sync generate-rust-bindings generate-signals.c generate-mount_flags.c clang-format shellcheck coverage-clean coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env
+.PHONY: check-no-openat2 check-systemd coverity generate-man sync generate-rust-bindings generate-signals.c generate-mount_flags.c clang-format shellcheck validate-keyring shfmt cppcheck coverage-clean coverage-reset coverage-check coverage-html coverage-xml coverage-summary coverage-multi-env

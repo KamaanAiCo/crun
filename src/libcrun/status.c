@@ -20,17 +20,18 @@
 #include <config.h>
 #include "status.h"
 #include "utils.h"
+#include "json_gen_utils.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <yajl/yajl_tree.h>
+#include <json-c/json.h>
+#include <ocispec/json_common.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <signal.h>
-
-#define YAJL_STR(x) ((const unsigned char *) (x))
+#include <limits.h>
 
 #define STEAL_POINTER(x, y) \
   do                        \
@@ -42,15 +43,35 @@
 struct pid_stat
 {
   char state;
+  long num_threads;
   unsigned long long starttime;
 };
 
-/* If ID is not NULL, then ennsure that it does not contain any slash.  */
+static inline bool
+is_valid_id_char (char c)
+{
+  if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+    return true;
+  return c == '_' || c == '+' || c == '.' || c == '-';
+}
+
 static int
 validate_id (const char *id, libcrun_error_t *err)
 {
-  if (id && strchr (id, '/') != NULL)
-    return crun_make_error (err, 0, "invalid character `/` in the ID `%s`", id);
+  if (id == NULL)
+    return 0;
+
+  if (id[0] == '\0')
+    return crun_make_error (err, 0, "empty container ID");
+
+  if (id[0] == '.')
+    return crun_make_error (err, 0, "invalid container ID `%s`", id);
+
+  for (size_t i = 0; id[i]; i++)
+    {
+      if (! is_valid_id_char (id[i]))
+        return crun_make_error (err, 0, "invalid character `%c` in the container ID `%s`", id[i], id);
+    }
 
   return 0;
 }
@@ -134,25 +155,14 @@ libcrun_get_state_directory (char **out, const char *state_root, const char *id,
 static int
 get_state_directory_status_file (char **out, const char *state_root, const char *id, libcrun_error_t *err)
 {
-  cleanup_free char *root = NULL;
-  cleanup_free char *path = NULL;
+  cleanup_free char *dir = NULL;
   int ret;
 
-  ret = validate_id (id, err);
+  ret = libcrun_get_state_directory (&dir, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = get_run_directory (&root, state_root, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  ret = append_paths (&path, err, root, id, "status", NULL);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  STEAL_POINTER (out, path);
-
-  return 0;
+  return append_paths (out, err, dir, "status", NULL);
 }
 
 static int
@@ -184,6 +194,7 @@ read_pid_stat (pid_t pid, struct pid_stat *st, libcrun_error_t *err)
   if (ret < 0)
     {
       st->starttime = 0;
+      st->num_threads = 0;
       st->state = 'X';
       /* The process already exited.  */
       libcrun_error_release (err);
@@ -206,11 +217,17 @@ read_pid_stat (pid_t pid, struct pid_stat *st, libcrun_error_t *err)
   st->state = *s;
 
   /* Seek to the starttime argument.  */
-  for (it = s + 1, i = 0; i < 19 && it != NULL; i++, it = strchr (it, ' ') + 1)
-    ;
+  for (it = s + 1, i = 0; i < 19; i++)
+    {
+      it = strchr (it, ' ');
+      if (it == NULL)
+        return crun_make_error (err, 0, "could not read process start time");
+      it++;
 
-  if (it == NULL || i != 19)
-    return crun_make_error (err, 0, "could not read process start time");
+      /* num_threads is the second argument before starttime.  */
+      if (i == 16)
+        st->num_threads = strtol (it, NULL, 10);
+    }
 
   errno = 0;
   st->starttime = strtoull (it, NULL, 10);
@@ -229,10 +246,10 @@ libcrun_write_container_status (const char *state_root, const char *id, libcrun_
   cleanup_free char *file = NULL;
   size_t len;
   cleanup_close int fd_write = -1;
-  const unsigned char *buf = NULL;
+  const char *buf = NULL;
   struct pid_stat st;
   const char *tmp;
-  yajl_gen gen = NULL;
+  cleanup_json_gen json_gen_ctx *gen = NULL;
 
   ret = get_state_directory_status_file (&file, state_root, id, err);
   if (UNLIKELY (ret < 0))
@@ -242,148 +259,93 @@ libcrun_write_container_status (const char *state_root, const char *id, libcrun_
   if (UNLIKELY (ret < 0))
     return ret;
 
-  status->process_start_time = st.starttime;
+  /* read_pid_stat returns a start time of 0 when the process already exited,
+     e.g. a restored container that terminated before the status is written.
+     Do not store the 0, libcrun_check_pid_valid treats it as "no start time
+     available" and would accept any process that later reuses the same pid.
+     Store a value that no process can have instead, so that the container is
+     reported as stopped.  */
+  status->process_start_time = st.starttime ? st.starttime : ULLONG_MAX;
 
   xasprintf (&file_tmp, "%s.tmp", file);
   fd_write = open (file_tmp, O_CREAT | O_WRONLY | O_CLOEXEC, 0700);
   if (UNLIKELY (fd_write < 0))
     return crun_make_error (err, errno, "cannot open status file");
 
-  gen = yajl_gen_alloc (NULL);
-  if (gen == NULL)
-    return crun_make_error (err, 0, "yajl_gen_alloc failed");
+  if (! json_gen_init (&gen, NULL))
+    return crun_make_error (err, 0, "json_gen_init failed");
 
-  yajl_gen_config (gen, yajl_gen_beautify, 1);
-  yajl_gen_config (gen, yajl_gen_validate_utf8, 1);
+  json_gen_config (gen, json_gen_beautify, 1);
 
-  r = yajl_gen_map_open (gen);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_OR_FAIL (json_gen_map_open (gen));
 
-  r = yajl_gen_string (gen, YAJL_STR ("pid"), strlen ("pid"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "pid");
+  GEN_OR_FAIL (map_int (gen, status->pid));
 
-  r = yajl_gen_integer (gen, status->pid);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "process-start-time");
+  GEN_OR_FAIL (map_uint (gen, status->process_start_time));
 
-  r = yajl_gen_string (gen, YAJL_STR ("process-start-time"), strlen ("process-start-time"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_integer (gen, status->process_start_time);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_string (gen, YAJL_STR ("cgroup-path"), strlen ("cgroup-path"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
+  GEN_KEY (gen, "cgroup-path");
   tmp = status->cgroup_path ? status->cgroup_path : "";
-  r = yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_STR (gen, tmp);
 
-  r = yajl_gen_string (gen, YAJL_STR ("scope"), strlen ("scope"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
+  GEN_KEY (gen, "scope");
   tmp = status->scope ? status->scope : "";
-  r = yajl_gen_string (gen, YAJL_STR (tmp), strlen (tmp));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_STR (gen, tmp);
 
-  r = yajl_gen_string (gen, YAJL_STR ("rootfs"), strlen ("rootfs"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "rootfs");
+  GEN_STR (gen, status->rootfs);
 
-  r = yajl_gen_string (gen, YAJL_STR (status->rootfs), strlen (status->rootfs));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "systemd-cgroup");
+  GEN_OR_FAIL (json_gen_bool (gen, status->systemd_cgroup));
 
-  r = yajl_gen_string (gen, YAJL_STR ("systemd-cgroup"), strlen ("systemd-cgroup"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "bundle");
+  GEN_STR (gen, status->bundle);
 
-  r = yajl_gen_bool (gen, status->systemd_cgroup);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_string (gen, YAJL_STR ("bundle"), strlen ("bundle"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_string (gen, YAJL_STR (status->bundle), strlen (status->bundle));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_string (gen, YAJL_STR ("created"), strlen ("created"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
-
-  r = yajl_gen_string (gen, YAJL_STR (status->created), strlen (status->created));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "created");
+  GEN_STR (gen, status->created);
 
   if (status->owner)
     {
-      r = yajl_gen_string (gen, YAJL_STR ("owner"), strlen ("owner"));
-      if (UNLIKELY (r != yajl_gen_status_ok))
-        goto yajl_error;
-
-      r = yajl_gen_string (gen, YAJL_STR (status->owner), strlen (status->owner));
-      if (UNLIKELY (r != yajl_gen_status_ok))
-        goto yajl_error;
+      GEN_KEY (gen, "owner");
+      GEN_STR (gen, status->owner);
     }
 
-  r = yajl_gen_string (gen, YAJL_STR ("detached"), strlen ("detached"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "detached");
+  GEN_OR_FAIL (json_gen_bool (gen, status->detached));
 
-  r = yajl_gen_bool (gen, status->detached);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_KEY (gen, "no-new-keyring");
+  GEN_OR_FAIL (json_gen_bool (gen, status->no_new_keyring));
 
-  r = yajl_gen_string (gen, YAJL_STR ("external_descriptors"), strlen ("external_descriptors"));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  if (status->external_descriptors)
+    {
+      GEN_KEY (gen, "external_descriptors");
+      GEN_STR (gen, status->external_descriptors);
+    }
 
-  r = yajl_gen_string (gen, YAJL_STR (status->external_descriptors), strlen (status->external_descriptors));
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  if (status->rootfs_mount_id)
+    {
+      GEN_KEY (gen, "rootfs-mount-id");
+      GEN_OR_FAIL (map_uint (gen, status->rootfs_mount_id));
+    }
 
-  r = yajl_gen_map_close (gen);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_OR_FAIL (json_gen_map_close (gen));
 
-  r = yajl_gen_get_buf (gen, &buf, &len);
-  if (UNLIKELY (r != yajl_gen_status_ok))
-    goto yajl_error;
+  GEN_OR_FAIL (json_gen_get_buf (gen, &buf, &len));
 
   ret = safe_write (fd_write, "status file", buf, len, err);
   if (UNLIKELY (ret < 0))
-    goto exit;
+    return ret;
 
   close_and_reset (&fd_write);
 
   if (UNLIKELY (rename (file_tmp, file) < 0))
-    {
-      ret = crun_make_error (err, errno, "cannot rename status file");
-      goto exit;
-    }
+    return crun_make_error (err, errno, "cannot rename status file");
 
-exit:
-  if (gen)
-    yajl_gen_free (gen);
+  return 0;
 
-  return ret;
-
-yajl_error:
-  if (gen)
-    yajl_gen_free (gen);
-
-  return yajl_error_to_crun_error (r, err);
+gen_error:
+  return json_gen_error_to_crun_error (r, err);
 }
 
 int
@@ -391,10 +353,11 @@ libcrun_read_container_status (libcrun_container_status_t *status, const char *s
                                libcrun_error_t *err)
 {
   cleanup_free char *buffer = NULL;
-  char err_buffer[256];
   int ret;
   cleanup_free char *file = NULL;
-  yajl_val tree, tmp;
+  json_object *doc = NULL;
+  json_object *tmp;
+  const char *val;
 
   ret = get_state_directory_status_file (&file, state_root, id, err);
   if (UNLIKELY (ret < 0))
@@ -425,78 +388,132 @@ libcrun_read_container_status (libcrun_container_status_t *status, const char *s
       return ret;
     }
 
-  tree = yajl_tree_parse (buffer, err_buffer, sizeof (err_buffer));
-  if (UNLIKELY (tree == NULL))
-    return crun_make_error (err, 0, "cannot parse status file: `%s`", err_buffer);
+  ret = parse_json_file (&doc, buffer, NULL, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
 
   {
-    const char *pid_path[] = { "pid", NULL };
-    tmp = yajl_tree_get (tree, pid_path, yajl_t_number);
+    tmp = json_object_object_get (doc, "pid");
     if (UNLIKELY (tmp == NULL))
-      return crun_make_error (err, 0, "`pid` missing in `%s`", file);
-    status->pid = strtoull (YAJL_GET_NUMBER (tmp), NULL, 10);
+      {
+        ret = crun_make_error (err, 0, "`pid` missing in `%s`", file);
+        goto exit;
+      }
+    if (UNLIKELY (! json_object_is_type (tmp, json_type_int)))
+      {
+        ret = crun_make_error (err, 0, "`pid` is not a numeric value in `%s`", file);
+        goto exit;
+      }
+    status->pid = (pid_t) json_object_get_int64 (tmp);
   }
   {
-    const char *process_start_time_path[] = { "process-start-time", NULL };
-    tmp = yajl_tree_get (tree, process_start_time_path, yajl_t_number);
+    tmp = json_object_object_get (doc, "process-start-time");
     if (UNLIKELY (tmp == NULL))
       status->process_start_time = 0; /* backwards compatibility */
+    else if (UNLIKELY (! json_object_is_type (tmp, json_type_int)))
+      {
+        ret = crun_make_error (err, 0, "`process-start-time` is not a numeric value in `%s`", file);
+        goto exit;
+      }
     else
-      status->process_start_time = strtoull (YAJL_GET_NUMBER (tmp), NULL, 10);
+      status->process_start_time = json_object_get_uint64 (tmp);
   }
   {
-    const char *cgroup_path[] = { "cgroup-path", NULL };
-    tmp = yajl_tree_get (tree, cgroup_path, yajl_t_string);
+    tmp = json_object_object_get (doc, "cgroup-path");
     if (UNLIKELY (tmp == NULL))
-      return crun_make_error (err, 0, "`cgroup-path` missing in `%s`", file);
-    status->cgroup_path = xstrdup (YAJL_GET_STRING (tmp));
+      {
+        ret = crun_make_error (err, 0, "`cgroup-path` missing in `%s`", file);
+        goto exit;
+      }
+    val = json_object_get_string (tmp);
+    if (UNLIKELY (val == NULL))
+      {
+        ret = crun_make_error (err, 0, "`cgroup-path` is not a string in `%s`", file);
+        goto exit;
+      }
+    status->cgroup_path = xstrdup (val);
   }
   {
-    const char *scope[] = { "scope", NULL };
-    tmp = yajl_tree_get (tree, scope, yajl_t_string);
-    status->scope = tmp ? xstrdup (YAJL_GET_STRING (tmp)) : NULL;
+    tmp = json_object_object_get (doc, "scope");
+    val = tmp ? json_object_get_string (tmp) : NULL;
+    status->scope = val ? xstrdup (val) : NULL;
   }
   {
-    const char *rootfs[] = { "rootfs", NULL };
-    tmp = yajl_tree_get (tree, rootfs, yajl_t_string);
+    tmp = json_object_object_get (doc, "rootfs");
     if (UNLIKELY (tmp == NULL))
-      return crun_make_error (err, 0, "`rootfs` missing in `%s`", file);
-    status->rootfs = xstrdup (YAJL_GET_STRING (tmp));
+      {
+        ret = crun_make_error (err, 0, "`rootfs` missing in `%s`", file);
+        goto exit;
+      }
+    val = json_object_get_string (tmp);
+    if (UNLIKELY (val == NULL))
+      {
+        ret = crun_make_error (err, 0, "`rootfs` is not a string in `%s`", file);
+        goto exit;
+      }
+    status->rootfs = xstrdup (val);
   }
   {
-    const char *systemd_cgroup[] = { "systemd-cgroup", NULL };
-    status->systemd_cgroup = YAJL_IS_TRUE (yajl_tree_get (tree, systemd_cgroup, yajl_t_true));
+    tmp = json_object_object_get (doc, "systemd-cgroup");
+    status->systemd_cgroup = tmp != NULL && json_object_get_boolean (tmp);
   }
   {
-    const char *bundle[] = { "bundle", NULL };
-    tmp = yajl_tree_get (tree, bundle, yajl_t_string);
+    tmp = json_object_object_get (doc, "bundle");
     if (UNLIKELY (tmp == NULL))
-      return crun_make_error (err, 0, "`bundle` missing in `%s`", file);
-    status->bundle = xstrdup (YAJL_GET_STRING (tmp));
+      {
+        ret = crun_make_error (err, 0, "`bundle` missing in `%s`", file);
+        goto exit;
+      }
+    val = json_object_get_string (tmp);
+    if (UNLIKELY (val == NULL))
+      {
+        ret = crun_make_error (err, 0, "`bundle` is not a string in `%s`", file);
+        goto exit;
+      }
+    status->bundle = xstrdup (val);
   }
   {
-    const char *created[] = { "created", NULL };
-    tmp = yajl_tree_get (tree, created, yajl_t_string);
+    tmp = json_object_object_get (doc, "created");
     if (UNLIKELY (tmp == NULL))
-      return crun_make_error (err, 0, "`created` missing in `%s`", file);
-    status->created = xstrdup (YAJL_GET_STRING (tmp));
+      {
+        ret = crun_make_error (err, 0, "`created` missing in `%s`", file);
+        goto exit;
+      }
+    val = json_object_get_string (tmp);
+    if (UNLIKELY (val == NULL))
+      {
+        ret = crun_make_error (err, 0, "`created` is not a string in `%s`", file);
+        goto exit;
+      }
+    status->created = xstrdup (val);
   }
   {
-    const char *owner[] = { "owner", NULL };
-    tmp = yajl_tree_get (tree, owner, yajl_t_string);
-    status->owner = tmp ? xstrdup (YAJL_GET_STRING (tmp)) : NULL;
+    tmp = json_object_object_get (doc, "owner");
+    val = tmp ? json_object_get_string (tmp) : NULL;
+    status->owner = val ? xstrdup (val) : NULL;
   }
   {
-    const char *detached[] = { "detached", NULL };
-    status->detached = YAJL_IS_TRUE (yajl_tree_get (tree, detached, yajl_t_true));
+    tmp = json_object_object_get (doc, "detached");
+    status->detached = tmp != NULL && json_object_get_boolean (tmp);
   }
   {
-    const char *external_descriptors[] = { "external_descriptors", NULL };
-    tmp = yajl_tree_get (tree, external_descriptors, yajl_t_string);
-    status->external_descriptors = tmp ? xstrdup (YAJL_GET_STRING (tmp)) : NULL;
+    tmp = json_object_object_get (doc, "no-new-keyring");
+    status->no_new_keyring = tmp != NULL && json_object_get_boolean (tmp);
   }
-  yajl_tree_free (tree);
-  return 0;
+  {
+    tmp = json_object_object_get (doc, "external_descriptors");
+    val = tmp ? json_object_get_string (tmp) : NULL;
+    status->external_descriptors = val ? xstrdup (val) : NULL;
+  }
+  {
+    tmp = json_object_object_get (doc, "rootfs-mount-id");
+    status->rootfs_mount_id = tmp != NULL && json_object_is_type (tmp, json_type_int) ? json_object_get_uint64 (tmp) : 0;
+  }
+  ret = 0;
+
+exit:
+  json_object_put (doc);
+  return ret;
 }
 
 int
@@ -517,8 +534,33 @@ libcrun_status_check_directories (const char *state_root, const char *id, libcru
     return crun_make_error (err, 0, "container `%s` already exists", id);
 
   if (UNLIKELY (mkdir (dir, 0700) < 0))
-    return crun_make_error (err, 0, "cannot create state directory for `%s`", id);
+    return crun_make_error (err, errno, "cannot create state directory for `%s`", id);
 
+  return 0;
+}
+
+/* Upper bound on the directories visited while removing a tree, so that an
+   attacker constantly creating new ones cannot keep the walk going forever.  */
+#define RMDIRFD_MAX_MOVES (1U << 20)
+
+static int
+rmdirfd_move_to (DIR **d, const char *name, libcrun_error_t *err)
+{
+  cleanup_close int fd = -1;
+  DIR *new_d;
+
+  fd = openat (dirfd (*d), name, O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (UNLIKELY (fd < 0))
+    return crun_make_error (err, errno, "cannot open directory `%s`", name);
+
+  new_d = fdopendir (fd);
+  if (UNLIKELY (new_d == NULL))
+    return crun_make_error (err, errno, "cannot open directory `%s`", name);
+
+  fd = -1;
+
+  closedir (*d);
+  *d = new_d;
   return 0;
 }
 
@@ -528,7 +570,14 @@ rmdirfd (const char *namedir, int fd, libcrun_error_t *err)
   int ret;
   cleanup_dir DIR *d = NULL;
   struct dirent *de;
+  struct stat root_st;
+  bool is_root = true;
+  unsigned int budget = RMDIRFD_MAX_MOVES;
   __attribute__ ((unused)) cleanup_close int fd_cleanup = fd;
+
+  ret = fstat (fd, &root_st);
+  if (UNLIKELY (ret < 0))
+    return crun_make_error (err, errno, "stat `%s`", namedir);
 
   d = fdopendir (fd);
   if (d == NULL)
@@ -537,8 +586,35 @@ rmdirfd (const char *namedir, int fd, libcrun_error_t *err)
   /* Now D owns FD. */
   fd_cleanup = -1;
 
-  for (de = readdir (d); de; de = readdir (d))
+  for (;;)
     {
+      errno = 0;
+      de = readdir (d);
+      if (de == NULL)
+        {
+          struct stat st;
+
+          if (UNLIKELY (errno != 0))
+            return crun_make_error (err, errno, "cannot read directory");
+
+          if (is_root)
+            break;
+
+          if (UNLIKELY (--budget == 0))
+            return crun_make_error (err, ELOOP, "the directory tree keeps changing while removing `%s`", namedir);
+
+          ret = rmdirfd_move_to (&d, "..", err);
+          if (UNLIKELY (ret < 0))
+            return ret;
+
+          ret = fstat (dirfd (d), &st);
+          if (UNLIKELY (ret < 0))
+            return crun_make_error (err, errno, "stat `..`");
+
+          is_root = st.st_dev == root_st.st_dev && st.st_ino == root_st.st_ino;
+          continue;
+        }
+
       if ((strcmp (de->d_name, ".") == 0) || (strcmp (de->d_name, "..") == 0))
         continue;
 
@@ -559,20 +635,23 @@ rmdirfd (const char *namedir, int fd, libcrun_error_t *err)
                   if (umount2 (procpath, MNT_DETACH) == 0)
                     goto retry_unlink;
                 }
+              if (! is_root)
+                return crun_make_error (err, EBUSY, "cannot rm directory `%s`", de->d_name);
             }
-          if (ret < 0 && errno == ENOTEMPTY)
+          else if (ret < 0 && errno == ENOTEMPTY)
             {
-              cleanup_close int cfd = -1;
+              if (UNLIKELY (--budget == 0))
+                return crun_make_error (err, ELOOP, "the directory tree keeps changing while removing `%s`", namedir);
 
-              cfd = openat (dirfd (d), de->d_name, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-              if (UNLIKELY (cfd < 0))
-                return crun_make_error (err, errno, "cannot open directory `%s`", de->d_name);
-
-              ret = rmdirfd (de->d_name, cfd, err);
+              ret = rmdirfd_move_to (&d, de->d_name, err);
               if (UNLIKELY (ret < 0))
                 return ret;
 
-              ret = unlinkat (dirfd (d), de->d_name, AT_REMOVEDIR);
+              is_root = false;
+            }
+          else if (ret < 0 && errno != ENOENT && ! is_root)
+            {
+              return crun_make_error (err, errno, "cannot rm `%s`", de->d_name);
             }
         }
     }
@@ -722,7 +801,13 @@ libcrun_check_pid_valid (libcrun_container_status_t *status, libcrun_error_t *er
   if (UNLIKELY (ret < 0))
     return ret;
 
-  if (status->process_start_time != st.starttime || st.state == 'Z' || st.state == 'X')
+  if (status->process_start_time != st.starttime || st.state == 'X')
+    return 0; /* stopped */
+
+  /* /proc/PID/stat describes only the thread group leader.  If it exited on
+     its own, it stays a zombie while other threads of the process are still
+     running.  */
+  if (st.state == 'Z' && st.num_threads <= 1)
     return 0; /* stopped */
 
   return 1; /* running, created, or paused */
@@ -743,18 +828,26 @@ libcrun_is_container_running (libcrun_container_status_t *status, libcrun_error_
   return 0; /* stopped */
 }
 
-int
-libcrun_status_create_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
+static int
+get_exec_fifo_path (char **out, const char *state_root, const char *id, libcrun_error_t *err)
 {
   cleanup_free char *state_dir = NULL;
-  cleanup_free char *fifo_path = NULL;
-  int ret, fd = -1;
+  int ret;
 
   ret = libcrun_get_state_directory (&state_dir, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
-  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  return append_paths (out, err, state_dir, "exec.fifo", NULL);
+}
+
+int
+libcrun_status_create_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
+{
+  cleanup_free char *fifo_path = NULL;
+  int ret, fd = -1;
+
+  ret = get_exec_fifo_path (&fifo_path, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -773,7 +866,6 @@ libcrun_status_create_exec_fifo (const char *state_root, const char *id, libcrun
 int
 libcrun_status_write_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
 {
-  cleanup_free char *state_dir = NULL;
   cleanup_free char *fifo_path = NULL;
   char buffer[1] = {
     0,
@@ -781,11 +873,7 @@ libcrun_status_write_exec_fifo (const char *state_root, const char *id, libcrun_
   cleanup_close int fd = -1;
   int ret;
 
-  ret = libcrun_get_state_directory (&state_dir, state_root, id, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  ret = get_exec_fifo_path (&fifo_path, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
@@ -807,17 +895,219 @@ libcrun_status_write_exec_fifo (const char *state_root, const char *id, libcrun_
 int
 libcrun_status_has_read_exec_fifo (const char *state_root, const char *id, libcrun_error_t *err)
 {
-  cleanup_free char *state_dir = NULL;
   cleanup_free char *fifo_path = NULL;
   int ret;
 
-  ret = libcrun_get_state_directory (&state_dir, state_root, id, err);
-  if (UNLIKELY (ret < 0))
-    return ret;
-
-  ret = append_paths (&fifo_path, err, state_dir, "exec.fifo", NULL);
+  ret = get_exec_fifo_path (&fifo_path, state_root, id, err);
   if (UNLIKELY (ret < 0))
     return ret;
 
   return crun_path_exists (fifo_path, err);
+}
+
+struct libcrun_status_s
+{
+  libcrun_container_status_t status;
+  char *id;
+  char *state_root;
+
+  /* The live state requires probing the container (and its cgroup), so it is
+     resolved on demand and cached here.  */
+  bool state_resolved;
+  libcrun_container_state_t state;
+  int running;
+};
+
+int
+libcrun_container_status_load (libcrun_context_t *context, const char *id, libcrun_status_t **out, libcrun_error_t *err)
+{
+  libcrun_status_t *st;
+  int ret;
+
+  st = xmalloc0 (sizeof (*st));
+
+  ret = libcrun_read_container_status (&st->status, context->state_root, id, err);
+  if (UNLIKELY (ret < 0))
+    {
+      free (st);
+      return ret;
+    }
+
+  st->id = xstrdup (id);
+  st->state_root = xstrdup (context->state_root);
+
+  *out = st;
+  return 0;
+}
+
+void
+libcrun_container_status_free (libcrun_status_t *st)
+{
+  if (st == NULL)
+    return;
+  libcrun_free_container_status (&st->status);
+  free (st->state_root);
+  free (st->id);
+  free (st);
+}
+
+int
+libcrun_status_get_state (libcrun_status_t *st, libcrun_container_state_t *state, int *running, libcrun_error_t *err)
+{
+  if (! st->state_resolved)
+    {
+      const char *state_string = NULL;
+      int ret;
+
+      ret = libcrun_get_container_state_string (st->id, &st->status, st->state_root, &state_string, &st->running, err);
+      if (UNLIKELY (ret < 0))
+        return ret;
+
+      if (state_string == NULL)
+        st->state = LIBCRUN_CONTAINER_STATUS_STOPPED;
+      else if (strcmp (state_string, "creating") == 0)
+        st->state = LIBCRUN_CONTAINER_STATUS_CREATING;
+      else if (strcmp (state_string, "created") == 0)
+        st->state = LIBCRUN_CONTAINER_STATUS_CREATED;
+      else if (strcmp (state_string, "running") == 0)
+        st->state = LIBCRUN_CONTAINER_STATUS_RUNNING;
+      else if (strcmp (state_string, "paused") == 0)
+        st->state = LIBCRUN_CONTAINER_STATUS_PAUSED;
+      else
+        st->state = LIBCRUN_CONTAINER_STATUS_STOPPED;
+
+      st->state_resolved = true;
+    }
+
+  if (state)
+    *state = st->state;
+  if (running)
+    *running = st->running;
+  return 0;
+}
+
+const char *
+libcrun_container_state_to_string (libcrun_container_state_t state)
+{
+  switch (state)
+    {
+    case LIBCRUN_CONTAINER_STATUS_CREATING:
+      return "creating";
+    case LIBCRUN_CONTAINER_STATUS_CREATED:
+      return "created";
+    case LIBCRUN_CONTAINER_STATUS_RUNNING:
+      return "running";
+    case LIBCRUN_CONTAINER_STATUS_PAUSED:
+      return "paused";
+    case LIBCRUN_CONTAINER_STATUS_STOPPED:
+      return "stopped";
+    }
+  return "unknown";
+}
+
+pid_t
+libcrun_status_get_pid (libcrun_status_t *st)
+{
+  return st->status.pid;
+}
+
+const char *
+libcrun_status_get_bundle (libcrun_status_t *st)
+{
+  return st->status.bundle;
+}
+
+const char *
+libcrun_status_get_rootfs (libcrun_status_t *st)
+{
+  return st->status.rootfs;
+}
+
+const char *
+libcrun_status_get_created (libcrun_status_t *st)
+{
+  return st->status.created;
+}
+
+const char *
+libcrun_status_get_owner (libcrun_status_t *st)
+{
+  return st->status.owner;
+}
+
+const char *
+libcrun_status_get_scope (libcrun_status_t *st)
+{
+  return st->status.scope;
+}
+
+const char *
+libcrun_status_get_external_descriptors (libcrun_status_t *st)
+{
+  return st->status.external_descriptors;
+}
+
+int
+libcrun_container_get_state_string (libcrun_context_t *context, const char *id, const char **out, int *running,
+                                    libcrun_error_t *err)
+{
+  cleanup_container_status libcrun_container_status_t status = {};
+  int local_running;
+  int ret;
+
+  ret = libcrun_read_container_status (&status, context->state_root, id, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  ret = libcrun_get_container_state_string (id, &status, context->state_root, out, &local_running, err);
+  if (UNLIKELY (ret < 0))
+    return ret;
+
+  if (running)
+    *running = local_running;
+  return 0;
+}
+
+int
+libcrun_get_state_dir (char **out, const char *state_root, const char *id, libcrun_error_t *err)
+{
+  return libcrun_get_state_directory (out, state_root, id, err);
+}
+
+int
+libcrun_container_list (libcrun_context_t *context, libcrun_container_list_t **out, libcrun_error_t *err)
+{
+  return libcrun_get_containers_list (out, context->state_root, err);
+}
+
+libcrun_container_iter_t *
+libcrun_container_list_iter (libcrun_container_list_t *l)
+{
+  libcrun_container_iter_t *it = xmalloc0 (sizeof (*it));
+  it->cur = l;
+  return it;
+}
+
+bool
+libcrun_container_iter_next (libcrun_container_iter_t *it, const char **id)
+{
+  if (it == NULL || it->cur == NULL)
+    return false;
+
+  if (id)
+    *id = it->cur->name;
+  it->cur = it->cur->next;
+  return true;
+}
+
+void
+libcrun_container_iter_free (libcrun_container_iter_t *it)
+{
+  free (it);
+}
+
+void
+libcrun_container_list_free (libcrun_container_list_t *l)
+{
+  libcrun_free_containers_list (l);
 }

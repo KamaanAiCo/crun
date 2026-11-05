@@ -174,7 +174,7 @@ libwasmtime_exec (void *cookie, libcrun_container_t *container arg_unused,
   // binary format.
   if (has_suffix (pathname, "wat") > 0)
     {
-      wasmtime_error_t *err = wasmtime_wat2wasm ((char *) &wasm_bytes, file_size, &wasm);
+      wasmtime_error_t *err = wasmtime_wat2wasm (wasm.data, wasm.size, &wasm_bytes);
       if (err != NULL)
         {
           wasmtime_error_message (err, &error_message);
@@ -290,6 +290,7 @@ struct custom_handler_s handler_wasmtime = {
   .name = "wasmtime",
   .alias = "wasm",
   .feature_string = "WASM:wasmtime",
+  .supports_open_tree_namespace = false,
   .load = libwasmtime_load,
   .unload = libwasmtime_unload,
   .run_func = libwasmtime_exec,

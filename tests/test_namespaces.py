@@ -63,6 +63,44 @@ def test_pid_namespace():
         return -1
 
 
+def test_no_mount_namespace():
+    """Test a container without a mount namespace."""
+    if is_rootless():
+        return (77, "requires root")
+
+    conf = base_config()
+    add_all_namespaces(conf)
+    conf['linux']['namespaces'] = [
+        ns for ns in conf['linux']['namespaces'] if ns['type'] != 'mount'
+    ]
+    del conf['linux']['rootfsPropagation']
+    conf['process']['args'] = ['/init', 'cat', '/proc/self/mountinfo']
+
+    rootfs = []
+    def save_rootfs(path):
+        rootfs.append(os.path.realpath(path))
+
+    try:
+        out, _ = run_and_get_output(conf, hide_stderr=True, callback_prepare_rootfs=save_rootfs)
+    except subprocess.CalledProcessError as e:
+        logger.info("test failed: %s", e)
+        return -1
+
+    mountpoints = [line.split()[4] for line in out.splitlines() if len(line.split()) > 4]
+    for i in ["/proc", "/dev", "/dev/pts", "/sys"]:
+        if i not in mountpoints:
+            logger.info("%s is not mounted in the container: %s", i, out)
+            return -1
+
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            mountpoint = line.split()[4]
+            if mountpoint == rootfs[0] or mountpoint.startswith(rootfs[0] + "/"):
+                logger.info("mount left behind: %s", line)
+                return -1
+    return 0
+
+
 def test_network_namespace():
     """Test network namespace isolation."""
     conf = base_config()
@@ -222,25 +260,19 @@ def test_user_namespace_mappings():
         {"containerID": 0, "hostID": host_gid, "size": 1}
     ]
 
-    # Verify mappings inside container
-    conf['process']['args'] = ['/init', 'cat', '/proc/self/uid_map']
-
     try:
-        out, _ = run_and_get_output(conf)
-        # Should see the mapping we configured
-        if '0' in out and '1000' in out:
-            return 0
-        return 0  # Command ran successfully
+        for filename, host_id in [('uid_map', host_uid), ('gid_map', host_gid)]:
+            conf['process']['args'] = ['/init', 'cat', '/proc/self/%s' % filename]
+            out, _ = run_and_get_output(conf)
+            if out.split() != ['0', str(host_id), '1']:
+                logger.info("unexpected %s: %s", filename, out)
+                return -1
+        return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        if is_nested_namespace_error(output):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if is_nested_namespace_error(str(e)):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
 
@@ -250,16 +282,6 @@ def test_user_namespace_root_in_container():
 
     conf = base_config()
     add_all_namespaces(conf, userns=True)
-
-    # Set up UID/GID mappings using current user's IDs
-    host_uid = os.geteuid()
-    host_gid = os.getegid()
-    conf['linux']['uidMappings'] = [
-        {"containerID": 0, "hostID": host_uid, "size": 1}
-    ]
-    conf['linux']['gidMappings'] = [
-        {"containerID": 0, "hostID": host_gid, "size": 1}
-    ]
 
     # Should see UID 0 inside container
     # init's id command returns "uid:gid" format
@@ -274,15 +296,9 @@ def test_user_namespace_root_in_container():
         return -1
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        # With hide_stderr=True, error output may not be captured
-        if not output or is_nested_namespace_error(output):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if is_nested_namespace_error(str(e)):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
 
@@ -331,6 +347,11 @@ def test_time_namespace():
 def test_setgroups_deny():
     """Test setgroups deny with user namespace."""
 
+    # Only an unprivileged user writing a single mapping directly has to
+    # deny setgroups first, root does not.
+    if os.geteuid() == 0:
+        return (77, "setgroups is not denied for root")
+
     conf = base_config()
     add_all_namespaces(conf, userns=True)
 
@@ -349,151 +370,15 @@ def test_setgroups_deny():
 
     try:
         out, _ = run_and_get_output(conf)
-        # Should be 'deny' by default for security
+        if out.strip() != 'deny':
+            logger.info("unexpected setgroups: %s", out)
+            return -1
         return 0
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        if is_nested_namespace_error(output):
-            return (77, "user namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
-        if is_nested_namespace_error(str(e)):
-            return (77, "user namespace not available in nested namespaces")
-        logger.info("test failed: %s", e)
-        return -1
-
-
-def test_multiple_uid_mappings():
-    """Test multiple UID/GID mappings in user namespace."""
-
-    # Multiple UID mappings require root or subuid/subgid support
-    # In rootless mode without subuids, we can only map our own UID once
-    if is_rootless():
-        return (77, "multiple UID mappings require root or subuid support")
-
-    conf = base_config()
-    add_all_namespaces(conf, userns=True)
-
-    # Set up multiple UID/GID mappings (only works as root)
-    conf['linux']['uidMappings'] = [
-        {"containerID": 0, "hostID": 0, "size": 1000},
-        {"containerID": 1000, "hostID": 1000, "size": 1000}
-    ]
-    conf['linux']['gidMappings'] = [
-        {"containerID": 0, "hostID": 0, "size": 1000},
-        {"containerID": 1000, "hostID": 1000, "size": 1000}
-    ]
-
-    # Check that mappings were applied
-    conf['process']['args'] = ['/init', 'cat', '/proc/self/uid_map']
-
-    try:
-        out, _ = run_and_get_output(conf)
-        # Should see multiple mapping lines
-        lines = [l for l in out.strip().split('\n') if l.strip()]
-        if len(lines) >= 2:
-            return 0
-        return 0  # Command ran successfully
-
-    except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        if is_nested_namespace_error(output):
-            return (77, "user namespace not available")
-        logger.info("test failed: %s", e)
-        return -1
-    except Exception as e:
-        if is_nested_namespace_error(str(e)):
-            return (77, "user namespace not available")
-        logger.info("test failed: %s", e)
-        return -1
-
-
-def test_namespace_path_sharing():
-    """Test joining an existing namespace via path."""
-
-    # This test is complex and may not work in all environments
-    # We'll test the error path for invalid namespace paths
-
-    conf = base_config()
-    # Add all namespaces except user
-    add_all_namespaces(conf)
-
-    # Try to join a non-existent namespace path
-    # This should fail gracefully
-    for ns in conf['linux']['namespaces']:
-        if ns['type'] == 'network':
-            ns['path'] = '/proc/99999999/ns/net'
-            break
-
-    conf['process']['args'] = ['/init', 'true']
-
-    try:
-        out, _ = run_and_get_output(conf)
-        # If it succeeds, the path was ignored or handled
-        return 0
-    except subprocess.CalledProcessError as e:
-        # Expected to fail with invalid path
-        return 0
-    except Exception as e:
-        # Other errors are also acceptable
-        return 0
-
-
-def test_hostname_without_uts_namespace():
-    """Test that setting hostname without UTS namespace fails."""
-
-    conf = base_config()
-    # Don't add UTS namespace
-    conf['linux']['namespaces'] = [
-        {'type': 'pid'},
-        {'type': 'mount'},
-        {'type': 'ipc'}
-    ]
-
-    # Try to set hostname without UTS namespace
-    conf['hostname'] = "should-fail"
-    conf['process']['args'] = ['/init', 'true']
-
-    try:
-        out, _ = run_and_get_output(conf)
-        # Should fail but error handling is graceful
-        logger.info("Expected error for hostname without UTS namespace")
-        return 0  # Accept either success or failure
-    except subprocess.CalledProcessError as e:
-        # Expected to fail
-        return 0
-    except Exception as e:
-        return 0
-
-
-def test_domainname_with_uts_namespace():
-    """Test setting domainname with UTS namespace."""
-
-    conf = base_config()
-    add_all_namespaces(conf, userns=is_rootless())
-
-    # Set domainname
-    conf['domainname'] = "test.domain.local"
-    conf['process']['args'] = ['/init', 'getdomainname']
-
-    try:
-        out, _ = run_and_get_output(conf)
-        # Domainname should be set
-        if 'test.domain.local' in out or out.strip():
-            return 0
-        return 0  # Accept if command ran
-
-    except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        if is_nested_namespace_error(output):
-            return (77, "namespace not available in nested namespaces")
-        # May fail in some environments
-        return 0
-    except Exception as e:
-        if is_nested_namespace_error(str(e)):
-            return (77, "namespace not available in nested namespaces")
         logger.info("test failed: %s", e)
         return -1
 
@@ -531,9 +416,6 @@ def test_multiple_uid_mappings():
         return 0  # Command ran successfully
 
     except subprocess.CalledProcessError as e:
-        output = e.output.decode('utf-8', errors='ignore') if e.output else ''
-        if "user" in output.lower() or "permission" in output.lower():
-            return (77, "user namespace not available")
         logger.info("test failed: %s", e)
         return -1
     except Exception as e:
@@ -622,12 +504,58 @@ def test_domainname_with_uts_namespace():
     except Exception as e:
         logger.info("test failed: %s", e)
         return -1
+
+
+def test_join_namespaces_mount_without_type():
+    """A mount without an explicit "type" must not crash when joining namespaces.
+
+    Reproduces the "pod with a userns + CDI device" case: the container joins
+    the user and IPC namespaces of another container and has a bind mount with
+    no "type" specified, which is optional in the OCI spec.
+
+    See https://github.com/containers/crun/issues/1948
+    """
+
+    conf = base_config()
+    conf['process']['args'] = ['/init', 'pause']
+    add_all_namespaces(conf, userns=True)
+
+    _, first_id = run_and_get_output(conf, detach=True)
+
+    try:
+        state = json.loads(run_crun_command(["state", first_id]))
+        ns_path = "/proc/%d/ns" % state['pid']
+
+        conf = base_config()
+        conf['process']['args'] = ['/init', 'echo', 'hello']
+        add_all_namespaces(conf, userns=True)
+        for ns in conf['linux']['namespaces']:
+            if ns['type'] in ('user', 'ipc'):
+                ns['path'] = os.path.join(ns_path, ns['type'])
+
+        # a bind mount with no "type"
+        conf['mounts'].append({
+            "destination": "/var/file",
+            "source": get_init_path(),
+            "options": ["bind", "ro"],
+        })
+
+        out, _ = run_and_get_output(conf)
+        if "hello" not in out:
+            return -1
+    except subprocess.CalledProcessError as e:
+        logger.info("test failed: %s", e)
+        return -1
+    finally:
+        run_crun_command(["delete", "-f", first_id])
+    return 0
 
 
 all_tests = {
     "pid-namespace": test_pid_namespace,
     "network-namespace": test_network_namespace,
     "mount-namespace": test_mount_namespace,
+    "no-mount-namespace": test_no_mount_namespace,
     "uts-namespace-hostname": test_uts_namespace_hostname,
     "ipc-namespace": test_ipc_namespace,
     "cgroup-namespace": test_cgroup_namespace,
@@ -639,6 +567,7 @@ all_tests = {
     "namespace-path-sharing": test_namespace_path_sharing,
     "hostname-without-uts": test_hostname_without_uts_namespace,
     "domainname-with-uts": test_domainname_with_uts_namespace,
+    "join-namespaces-mount-without-type": test_join_namespaces_mount_without_type,
 }
 
 if __name__ == "__main__":

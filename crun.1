@@ -35,11 +35,11 @@ List known containers.
 
 .PP
 \fBmounts add\fP
-Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container.  The command is experimental and can be changed without notice.
+Add mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Each mount listed there is added to the running container; symlinks in its destination path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 .PP
 \fBmounts remove\fP
-Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used.  The command is experimental and can be changed without notice.
+Remove mounts while the container is running.  It requires two arguments: the container ID and a JSON file containing the mounts section of the OCI config file.  Only the destination attribute for each mount is used; symlinks in its path are not followed.  It fails if the container process has moved to a mount namespace that is not owned by the user namespace of the container.  The command is experimental and can be changed without notice.
 
 .PP
 \fBkill\fP
@@ -134,18 +134,15 @@ Define the log level.  It can either be \fBdebug\fP, \fBwarning\fP or \fBerror\f
 The default is \fBerror\fP\&.
 
 .PP
-\fB--no-pivot\fP
-Use \fBchroot(2)\fR instead of \fBpivot_root(2)\fR when creating the container.
-This option is not safe, and should be avoided.
-
-.PP
 \fB--root\fP=\fIDIR\fP
 Defines where to store the state for crun containers.
 
 .PP
 \fB--systemd-cgroup\fP
 Use systemd for configuring cgroups.  If not specified, the cgroup is
-created directly using the cgroupfs backend.
+created directly using the cgroupfs backend.  Same as
+\fB--cgroup-manager\fP=\fBsystemd\fP; it conflicts with any other
+\fB--cgroup-manager\fP value.
 
 .PP
 \fB--cgroup-manager\fP=\fIMANAGER\fP
@@ -185,6 +182,11 @@ the container.
 Keep the same session key
 
 .PP
+\fB--no-pivot\fP
+Use \fBchroot(2)\fR instead of \fBpivot_root(2)\fR when creating the container.
+This option is not safe, and should be avoided.
+
+.PP
 \fB--preserve-fds\fP=\fIN\fP
 Additional number of FDs to pass into the container.
 
@@ -213,6 +215,11 @@ the container.
 Keep the same session key.
 
 .PP
+\fB--no-pivot\fP
+Use \fBchroot(2)\fR instead of \fBpivot_root(2)\fR when creating the container.
+This option is not safe, and should be avoided.
+
+.PP
 \fB--preserve-fds\fP=\fIN\fP
 Additional number of FDs to pass into the container.
 
@@ -232,8 +239,8 @@ crun [global options] delete [options] CONTAINER
 Delete the container even if it is still running.
 
 .PP
-\fB--regex\fP=\fIREGEX\fP
-Delete all the containers that satisfy the specified regex.
+\fB--regex\fP
+Treat \fICONTAINER\fP as a regular expression and delete all matching containers.
 
 .SH EXEC OPTIONS
 crun [global options] exec [options] CONTAINER CMD
@@ -293,7 +300,7 @@ Path to the file that will contain the new process PID.
 Allocate a pseudo TTY.
 
 .PP
-**-u \fIUSERSPEC\fP \fB--user\fP=\fIUSERSPEC\fP
+\fB-u\fP \fIUSERSPEC\fP \fB--user\fP=\fIUSERSPEC\fP
 Specify the user in the form UID[:GID].
 
 .SH LIST OPTIONS
@@ -311,8 +318,8 @@ crun [global options] kill [options] CONTAINER SIGNAL
 Kill all the processes in the container.
 
 .PP
-\fB--regex\fP=\fIREGEX\fP
-Kill all the containers that satisfy the specified regex.
+\fB--regex\fP
+Treat \fICONTAINER\fP as a regular expression and send the specified signal to all matching containers.
 
 .SH PS OPTIONS
 crun [global options] ps [options]
@@ -498,6 +505,10 @@ with the specified value. This is useful when restoring
 a container into an existing Pod and selinux labels
 need to be changed during restore.
 
+.PP
+\fB--no-new-keyring\fP
+Keep the same session key.
+
 
 .SH Extensions to OCI
 .SH \fBrun.oci.mount_context_type=context\fR
@@ -511,7 +522,7 @@ Valid context types are:
   rootcontext
 
 .PP
-More information on how the context mount flags works see the \fBmount(8)\fR man page.
+More information on how the context mount flags work can be found in the \fBmount(8)\fR man page.
 
 .SH \fBrun.oci.seccomp.receiver=PATH\fR
 If the annotation \fBrun.oci.seccomp.receiver=PATH\fR is specified, the
@@ -684,7 +695,7 @@ rather than the file or directory the symbolic link points to.
 
 .SH r$FLAG mount options
 If a \fBr$FLAG\fR mount option is specified then the flag \fB$FLAG\fR is set
-recursively for each children mount.
+recursively for each child mount.
 
 .PP
 These flags are supported:
@@ -805,7 +816,7 @@ mapping if it overlaps multiple ranges in the user namespace.  In such
 a case, there won't be any error reported.
 
 .SH Automatically create user namespace
-When running as user different than root, an user namespace is
+When running as a user other than root, a user namespace is
 automatically created even if it is not specified in the config file.
 The current user is mapped to the ID 0 in the container, and any
 additional id specified in the files \fB/etc/subuid\fR and \fB/etc/subgid\fR

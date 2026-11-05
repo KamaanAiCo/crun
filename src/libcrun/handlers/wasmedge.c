@@ -125,11 +125,19 @@ libwasmedge_exec (void *cookie, __attribute__ ((unused)) libcrun_container_t *co
   // Check if the necessary environment variables are set
   const char *plugin_path_env = getenv ("WASMEDGE_PLUGIN_PATH");
   if (plugin_path_env != NULL)
-    WasmEdge_PluginLoadFromPath (plugin_path_env);
+    {
+      if (WasmEdge_PluginLoadFromPath == NULL)
+        error (EXIT_FAILURE, 0, "could not find symbol `WasmEdge_PluginLoadFromPath` in `libwasmedge.so.0`");
+      WasmEdge_PluginLoadFromPath (plugin_path_env);
+    }
 
   const char *nnpreload_env = getenv ("WASMEDGE_WASINN_PRELOAD");
   if (nnpreload_env != NULL)
-    WasmEdge_PluginInitWASINN (&nnpreload_env, 1);
+    {
+      if (WasmEdge_PluginInitWASINN == NULL)
+        error (EXIT_FAILURE, 0, "could not find symbol `WasmEdge_PluginInitWASINN` in `libwasmedge.so.0`");
+      WasmEdge_PluginInitWASINN (&nnpreload_env, 1);
+    }
 
   vm = WasmEdge_VMCreate (configure, NULL);
   if (UNLIKELY (vm == NULL))
@@ -219,7 +227,7 @@ libwasmedge_configure_container (void *cookie arg_unused, enum handler_configure
     "rbind"
   };
 
-  ret = libcrun_container_do_bind_mount (container, "/usr/lib/wasmedge ", "/usr/lib/wasmedge", options, 5, err);
+  ret = libcrun_container_do_bind_mount (container, "/usr/lib/wasmedge", "/usr/lib/wasmedge", options, 5, err);
   if (ret < 0)
     {
       if (crun_error_get_errno (err) != ENOENT)
@@ -234,6 +242,7 @@ struct custom_handler_s handler_wasmedge = {
   .name = "wasmedge",
   .alias = "wasm",
   .feature_string = "WASM:wasmedge",
+  .supports_open_tree_namespace = false,
   .load = libwasmedge_load,
   .unload = libwasmedge_unload,
   .run_func = libwasmedge_exec,

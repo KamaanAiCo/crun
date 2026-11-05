@@ -78,19 +78,26 @@ syscall_sched_setattr (pid_t pid, struct sched_attr_s *attr, unsigned int flags)
 #endif
 }
 
+/* Maximum number of CPUs the reset mask can cover.  The mask passed to
+   sched_setaffinity is truncated by the kernel to its own cpumask size, so
+   using a mask larger than the number of CPUs on the system is safe, while a
+   mask that is too small fails with EINVAL when the target cgroup only allows
+   CPUs outside of it.  */
+#define MAX_CPU_MASK_BITS (64 * 1024)
+
 int
 libcrun_reset_cpu_affinity_mask (pid_t pid, libcrun_error_t *err)
 {
+  cpu_set_t mask[MAX_CPU_MASK_BITS / (CHAR_BIT * sizeof (cpu_set_t))];
   int ret;
-  cpu_set_t mask;
 
   /* Reset the inherited cpu affinity. Old kernels do that automatically, but
      new kernels remember the affinity that was set before the cgroup move.
      This is undesirable, because it inherits the systemd affinity when the container
      should really move to the container space cpus.
      See: https://issues.redhat.com/browse/OCPBUGS-15102   */
-  memset (&mask, 0xFF, sizeof (cpu_set_t));
-  ret = sched_setaffinity (pid, sizeof (mask), &mask);
+  memset (mask, 0xFF, sizeof (mask));
+  ret = sched_setaffinity (pid, sizeof (mask), mask);
   if (UNLIKELY (ret < 0))
     return crun_make_error (err, errno, "sched_setaffinity");
   return 0;
@@ -123,7 +130,7 @@ diagnose_scheduler_failure (libcrun_error_t *err, runtime_spec_schema_config_sch
       /* sched(7) says "under the current implementation, all of the parameter values
        * must be at least 1024 <...> and less than 2^63". */
       const uint64_t min = 1024;
-      const uint64_t max = 1ULL << 63;
+      const uint64_t max = (1ULL << 63) - 1;
 
       if (attr->sched_runtime < min || attr->sched_runtime > max)
         return crun_make_error (err, errno, "sched_setattr: `SCHED_DEADLINE` runtime (%" PRIu64 ") must be between %" PRIu64 " and %" PRIu64,
@@ -202,6 +209,9 @@ libcrun_set_scheduler (pid_t pid, runtime_spec_schema_config_schema_process *pro
     {
       char *key = process->scheduler->flags[s];
 
+      if (key == NULL)
+        return crun_make_error (err, EINVAL, "scheduler flag is not specified");
+
       if (strcmp (key, "SCHED_FLAG_RESET_ON_FORK") == 0)
         attr.sched_flags |= SCHED_FLAG_RESET_ON_FORK;
       else if (strcmp (key, "SCHED_FLAG_RECLAIM") == 0)
@@ -246,7 +256,7 @@ libcrun_set_cpu_affinity_from_string (pid_t pid, const char *str, libcrun_error_
 
   alloc_size = CPU_ALLOC_SIZE (bitmask_size * CHAR_BIT);
 
-  cpuset = CPU_ALLOC (alloc_size);
+  cpuset = CPU_ALLOC (bitmask_size * CHAR_BIT);
   if (UNLIKELY (cpuset == NULL))
     OOM ();
 
